@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment and local secrets
+.env
+.env.*
+.streamlit/secrets.toml
+secrets/
+kaggle.json
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build and generated outputs
+artifacts/
+data/
+indices/
+*.log
+*.tmp
+temp_cases.csv
+tmp_load_test.py
+
+# Notebook checkpoints
+.ipynb_checkpoints/

@@ -1,0 +1,111 @@
+/* ----- Full page background ----- */
+html, body, [data-testid="stAppViewContainer"] {
+  height: 100%;
+}
+
+[data-testid="stAppViewContainer"]{
+  background:
+    linear-gradient(rgba(0,0,0,0.55), rgba(0,0,0,0.55)),
+    url("data:image/jpg;base64,{{BG_BASE64}}");
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+/* remove default padding to help centering */
+.block-container {
+  padding-top: 0rem !important;
+  padding-bottom: 0rem !important;
+  max-width: 1200px;
+}
+
+/* optional: hide Streamlit header/footer */
+header { visibility: hidden; }
+footer { visibility: hidden; }
+
+/* ----- Center wrapper ----- */
+.page-center{
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4vh 1.5rem;
+}
+
+/* ----------- PANEL (the grey rounded box) ----------- */
+.login-panel{
+  width: 520px;
+  max-width: 92vw;
+  margin: 0 auto;
+
+  background: rgba(90, 90, 90, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 16px;
+
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+
+  padding: 32px 36px 28px 36px;
+  box-shadow: 0 18px 40px rgba(0,0,0,0.55);
+}
+
+/* ----------- TITLE + TAGLINE inside panel ----------- */
+.brand{
+  text-align: center;
+  font-size: 38px;
+  font-weight: 800;
+  color: #b0124b;
+  margin: 2px 0 2px 0;
+}
+
+.tagline{
+  text-align: center;
+  font-size: 12px;
+  letter-spacing: 0.8px;
+  color: rgba(255,255,255,0.75);
+  margin-bottom: 22px;
+}
+
+/* ----------- INPUTS inside panel ----------- */
+div[data-testid="stTextInput"]{
+  margin-bottom: 18px;
+}
+
+div[data-testid="stTextInput"] input{
+  height: 44px;
+  border-radius: 10px;
+  border: none;
+  outline: none;
+  background: rgba(255,255,255,0.95);
+  color: #333;
+
+  padding-left: 16px;
+  padding-right: 16px;
+
+  box-shadow: 0 8px 18px rgba(0,0,0,0.25);
+}
+
+div[data-testid="stTextInput"] input::placeholder{
+  color: rgba(0,0,0,0.35);
+  letter-spacing: 0.6px;
+}
+
+/* ----------- BUTTON inside panel ----------- */
+div[data-testid="stButton"] button{
+  height: 50px;
+  border-radius: 10px;
+  border: none !important;
+
+  background: linear-gradient(90deg, #ff1e5a, #e9004f);
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+
+  margin-top: 8px;
+  box-shadow: 0 14px 28px rgba(0,0,0,0.35);
+}
+
+div[data-testid="stButton"] button:hover{
+  filter: brightness(1.05);
+  transform: translateY(-1px);
+}
