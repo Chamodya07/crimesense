@@ -33,7 +33,7 @@ def _encode_image(path: Path) -> tuple[str, str]:
 
 
 def inject_styles() -> None:
-    """Load CSS and override the hero background with the local asset if present."""
+    """Load CSS and override login page backgrounds with the local asset if present."""
     css = CSS_FILE.read_text(encoding="utf-8") if CSS_FILE.exists() else ""
 
     preferred = ASSETS_DIR / "board.jpg"
@@ -82,28 +82,30 @@ def render_welcome() -> None:
 
 def render_login_card() -> None:
     st.markdown('<div id="login-card"></div>', unsafe_allow_html=True)
-    with st.form("login_panel_form", clear_on_submit=False):
-        username = st.text_input("", placeholder="username", label_visibility="collapsed", key="user_main")
-        password = st.text_input("", placeholder="password", type="password", label_visibility="collapsed", key="pass_main")
-        clicked = st.form_submit_button("Log In", use_container_width=True)
+    left, center, right = st.columns([1.15, 1, 1.15])
+    with center:
+        with st.form("login_panel_form", clear_on_submit=False):
+            username = st.text_input("", placeholder="username", label_visibility="collapsed", key="user_main")
+            password = st.text_input("", placeholder="password", type="password", label_visibility="collapsed", key="pass_main")
+            clicked = st.form_submit_button("Log In", use_container_width=True)
 
-        if clicked:
-            if not username or not password:
-                st.error("Please enter username and password.")
-                return
+            if clicked:
+                if not username or not password:
+                    st.error("Please enter username and password.")
+                    return
 
-            try:
-                user = authenticate_user(username, password)
-            except AuthConfigError as err:
-                st.error(str(err))
-                return
+                try:
+                    user = authenticate_user(username, password)
+                except AuthConfigError as err:
+                    st.error(str(err))
+                    return
 
-            if user is None:
-                st.error("Invalid username or password.")
-                return
+                if user is None:
+                    st.error("Invalid username or password.")
+                    return
 
-            login_user(user)
-            st.switch_page(DEFAULT_PAGE)
+                login_user(user)
+                st.switch_page(DEFAULT_PAGE)
 
 
 def main() -> None:

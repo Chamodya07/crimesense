@@ -185,9 +185,9 @@ body {
 /* Style the login form container (only form in main page) */
 /* Narrow scope: only the login form in main page */
 form[data-testid="stForm"][aria-label="login_panel_form"]{
-  width: min(700px, calc(100vw - 220px));
-  max-width: calc(100vw - 64px); /* ~32px margin on each side */
-  margin: 10 auto;
+  width: min(420px, calc(100vw - 48px));
+  max-width: 420px;
+  margin: 10px auto;
   background: rgba(255, 255, 255, 0.82);
   border: 1px solid rgba(255, 255, 255, 0.25);
   border-radius: 16px;
@@ -317,7 +317,7 @@ form[data-testid="stForm"][aria-label="login_panel_form"] div[data-testid="stBut
   content: '';
   position: absolute;
   inset: 0;
-  background: rgba(255,255,255,0.04);
+  background: rgba(255,255,255,0.5);
   z-index: -1;
 }
 
