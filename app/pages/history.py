@@ -124,6 +124,8 @@ def _record_to_ui_case(rec: dict) -> dict:
     motive = motive_obj.get("pred") if isinstance(motive_obj, dict) else motive_obj
 
     structured = rec.get("inputs") or rec.get("structured_input") or {}
+    if not isinstance(structured, dict):
+        structured = {}
     created_raw = rec.get("created_at_local") or rec.get("created_at") or rec.get("timestamp")
     created_text = _to_time_text(created_raw)
     created_display = created_text or "-"
@@ -139,7 +141,9 @@ def _record_to_ui_case(rec: dict) -> dict:
     )
 
     feedback = rec.get("feedback") or {}
-    feedback_text = feedback.get("text") or ""
+    if not isinstance(feedback, dict):
+        feedback = {}
+    feedback_text = str(feedback.get("text") or "").strip()
     helpfulness = feedback.get("helpful") or feedback.get("helpfulness")
     notes_parts = []
     if feedback_text:
@@ -147,7 +151,8 @@ def _record_to_ui_case(rec: dict) -> dict:
     if helpfulness:
         notes_parts.append(f"Helpful: {helpfulness}")
 
-    case_id = rec.get("case_id") or rec.get("id") or rec.get("record_id") or ""
+    doc_id = str(rec.get("id") or rec.get("record_id") or "").strip()
+    case_id = str(rec.get("case_id") or rec.get("id") or rec.get("record_id") or "").strip()
     crime_title = structured.get("primary_type") or structured.get("crime_type") or "Unknown Crime Type"
     crime_title = str(crime_title).strip()
     if crime_title.lower() in {"", "unknown", "none", "-", "nan"}:
@@ -173,6 +178,7 @@ def _record_to_ui_case(rec: dict) -> dict:
 
     motive_band = motive_obj.get("band") if isinstance(motive_obj, dict) else ""
     motive_conf = motive_obj.get("conf") if isinstance(motive_obj, dict) else ""
+    motive_line = ""
     if motive:
         motive_line = f"Motive: {motive}"
         extra = []
@@ -190,6 +196,8 @@ def _record_to_ui_case(rec: dict) -> dict:
         notes_parts.append("No similar cases saved.")
 
     return {
+        "_selector_id": doc_id or case_id,
+        "doc_id": doc_id,
         "id": str(case_id),
         "title": crime_title,
         "date": created_display,
@@ -206,11 +214,20 @@ def _record_to_ui_case(rec: dict) -> dict:
             or structured.get("gender")
             or "-"
         ),
-        "location": structured.get("location_desc") or structured.get("location") or "-",
+        "location": (
+            structured.get("location_desc")
+            or structured.get("location")
+            or structured.get("place")
+            or structured.get("area")
+            or "-"
+        ),
         "description": description_text,
         "description_preview": description_preview,
         "risk": str(risk),
         "notes": " | ".join(notes_parts) if notes_parts else "",
+        "motive": motive_line or "-",
+        "feedback_text": feedback_text or "-",
+        "helpful": str(helpfulness) if helpfulness not in (None, "") else "-",
         "inputs_full": _make_json_safe(structured),
         "outputs_full": _make_json_safe(outputs),
         "similar_cases_full": _make_json_safe(similar_cases),
@@ -224,9 +241,9 @@ def _record_to_ui_case(rec: dict) -> dict:
 def _load_cases():
     """Load full case records from Firestore history collection."""
     try:
-        from services.firebase_service import list_cases
+        from services.firebase_service import list_history_records
 
-        records = list_cases(limit=50)
+        records = list_history_records(limit=50)
         if records:
             return [_record_to_ui_case(record) for record in records]
         return []
@@ -239,68 +256,148 @@ def seed_cases():
     return _load_cases()
 
 
-def _load_case_by_id(case_id: str) -> dict | None:
-    try:
-        from services.firebase_service import get_case_by_id
-
-        record = get_case_by_id(case_id)
-        if not record:
-            return None
-        return _record_to_ui_case(record)
-    except Exception:
-        return None
+def _format_case_label(case: dict) -> str:
+    return f"Case ID: {case.get('id', '-')} | {case.get('title', 'Unknown')} | {case.get('date', '-')}"
 
 
-def _render_case_sections(case: dict) -> None:
-    st.markdown("### Inputs")
-    st.json(case.get("inputs_full", {}))
+def _humanize_key(key: object) -> str:
+    return str(key).replace("_", " ").strip().title()
 
-    st.markdown("### Description")
-    st.write(case.get("description", "No description provided."))
 
-    st.markdown("### Outputs")
-    st.json(case.get("outputs_full", {}))
+def _format_display_value(value: object) -> str:
+    if value in (None, ""):
+        return "-"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, float):
+        return f"{value:.3f}".rstrip("0").rstrip(".")
+    if isinstance(value, dict):
+        pred = value.get("pred") if isinstance(value, dict) else None
+        band = value.get("band") if isinstance(value, dict) else None
+        conf = value.get("conf") if isinstance(value, dict) else None
+        if pred not in (None, ""):
+            details = []
+            if band not in (None, ""):
+                details.append(f"Band: {band}")
+            if conf not in (None, ""):
+                details.append(f"Confidence: {_format_display_value(conf)}")
+            if details:
+                return f"{pred} ({', '.join(details)})"
+            return str(pred)
 
-    st.markdown("### RAG Similar Cases")
-    rag_items = case.get("similar_cases_full") or []
-    if isinstance(rag_items, list) and rag_items:
-        try:
-            import pandas as pd
+        parts = []
+        for sub_key, sub_value in value.items():
+            formatted = _format_display_value(sub_value)
+            if formatted == "-":
+                continue
+            parts.append(f"{_humanize_key(sub_key)}: {formatted}")
+        return " | ".join(parts) if parts else "-"
+    if isinstance(value, (list, tuple, set)):
+        items = []
+        for item in value:
+            formatted = _format_display_value(item)
+            if formatted != "-":
+                items.append(formatted)
+        if not items:
+            return "-"
+        preview = items[:5]
+        suffix = "..." if len(items) > 5 else ""
+        return f"{', '.join(preview)}{suffix}"
+    return str(value)
 
-            df_rag = pd.DataFrame(rag_items)
-            preferred = [
-                "score",
-                "case_id",
-                "type",
-                "place",
-                "area",
-                "victim_age",
-                "victim_sex",
-                "victim_race",
-                "suspect_age",
-                "suspect_sex",
-                "suspect_race",
-            ]
-            cols = [c for c in preferred if c in df_rag.columns]
-            if not cols:
-                cols = list(df_rag.columns)
-            st.dataframe(df_rag.reindex(columns=cols))
-        except Exception:
-            st.json(rag_items)
-    else:
-        st.write("No similar cases saved.")
 
-    st.markdown("### Feedback")
-    feedback = case.get("feedback_full") or {}
-    if isinstance(feedback, dict):
-        st.write(f"Helpful: {feedback.get('helpful') or '-'}")
-        st.write(feedback.get("text") or "-")
-    else:
+def _render_compact_section(title: str, data: object, *, exclude_keys: set[str] | None = None) -> None:
+    st.markdown(f"### {title}")
+    if not isinstance(data, dict) or not data:
         st.write("-")
+        return
 
-    if case.get("_raw"):
-        st.caption("From stored predictions.")
-        st.json(case.get("_raw_safe") or case.get("_raw"))
+    exclude = exclude_keys or set()
+    rows = []
+    for key, value in data.items():
+        if key in exclude:
+            continue
+        formatted = _format_display_value(value)
+        if formatted == "-":
+            continue
+        rows.append({"Field": _humanize_key(key), "Value": formatted})
+
+    if not rows:
+        st.write("-")
+        return
+
+    st.table(
+        {
+            "Field": [row["Field"] for row in rows],
+            "Value": [row["Value"] for row in rows],
+        }
+    )
+
+
+def _render_rag_evidence(case: dict) -> None:
+    st.markdown("### RAG evidence")
+    rag_items = case.get("similar_cases_full") or []
+    if not isinstance(rag_items, list) or not rag_items:
+        st.write("No RAG evidence saved.")
+        return
+
+    try:
+        import pandas as pd
+
+        df_rag = pd.DataFrame(rag_items)
+        preferred = [
+            "score",
+            "case_id",
+            "type",
+            "place",
+            "area",
+            "risk_level",
+            "motive",
+            "victim_age",
+            "victim_sex",
+            "suspect_age",
+            "suspect_sex",
+        ]
+        cols = [c for c in preferred if c in df_rag.columns]
+        if not cols:
+            cols = list(df_rag.columns)
+        st.dataframe(df_rag.reindex(columns=cols), use_container_width=True, hide_index=True)
+    except Exception:
+        st.write("Saved RAG evidence could not be rendered as a table.")
+
+
+def _render_export_button(case: dict) -> None:
+    safe_case_id = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_"
+        for char in str(case.get("id") or "case")
+    )
+    if DOCX_AVAILABLE:
+        st.download_button(
+            "Export DOCX",
+            data=build_case_docx(case),
+            file_name=f"{safe_case_id}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+        return
+
+    if PDF_AVAILABLE:
+        st.download_button(
+            "Export PDF",
+            data=build_case_pdf(case),
+            file_name=f"{safe_case_id}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+        return
+
+    st.download_button(
+        "Export RTF",
+        data=build_case_rtf(case),
+        file_name=f"{safe_case_id}.rtf",
+        mime="application/rtf",
+        use_container_width=True,
+    )
 
 
 def build_case_docx(case: dict) -> bytes:
@@ -411,6 +508,7 @@ def render_case_details(case: dict, show_title: bool = True) -> None:
     c = {k: v for k, v in case.items() if k != "_raw"}
     if show_title:
         st.subheader(c["title"])
+        st.caption(f"Case ID: {c.get('id', '-')}")
     meta_cols = st.columns(3)
     meta_cols[0].markdown(f"**Date:** {c['date']}")
     meta_cols[1].markdown(f"**Location:** {c['location']}")
@@ -422,15 +520,39 @@ def render_case_details(case: dict, show_title: bool = True) -> None:
     info_cols[1].markdown(f"**Age:** {c.get('age','--') if c.get('age') is not None else '--'}")
     info_cols[2].markdown(f"**Gender:** {c.get('gender','--')}")
 
+    _render_compact_section(
+        "Inputs",
+        c.get("inputs_full"),
+        exclude_keys={"narrative_text", "description", "victim_name", "victim_age", "victim_gender", "victim_sex"},
+    )
+
     st.markdown("### Description")
     st.write(c["description"])
 
-    st.markdown("### Notes / recommendations")
-    st.write(c["notes"])
+    output_payload = c.get("outputs_full")
+    if isinstance(output_payload, dict) and isinstance(output_payload.get("final"), dict):
+        compact_outputs = dict(output_payload.get("final") or {})
+        if "risk_level" not in compact_outputs and output_payload.get("final_risk_category") not in (None, ""):
+            compact_outputs["risk_level"] = output_payload.get("final_risk_category")
+        if output_payload.get("combined_confidence") not in (None, ""):
+            compact_outputs["combined_confidence"] = output_payload.get("combined_confidence")
+        if output_payload.get("model_version") not in (None, ""):
+            compact_outputs["model_version"] = output_payload.get("model_version")
+    else:
+        compact_outputs = output_payload
 
-    if case.get("_raw"):
-        st.caption("From stored predictions.")
-        st.json(case.get("_raw_safe") or case.get("_raw"))
+    _render_compact_section(
+        "Outputs",
+        compact_outputs,
+        exclude_keys={"explanations", "fusion_meta", "tabular", "nlp", "warnings"},
+    )
+
+    st.markdown("### Notes / recommendations")
+    st.markdown(c.get("motive", "-"))
+    st.markdown(f"**Feedback:** {c.get('feedback_text', '-')}")
+    st.markdown(f"**Helpful:** {c.get('helpful', '-')}")
+
+    _render_rag_evidence(c)
 
 
 def main() -> None:
@@ -456,7 +578,7 @@ def main() -> None:
         with s_col:
             st.text_input(
                 "Search cases",
-                placeholder="Search by ID, title, date, or victim",
+                placeholder="Search by case ID or crime type",
                 label_visibility="collapsed",
                 key="history_search_input",
             )
@@ -471,10 +593,21 @@ def main() -> None:
             for c in cases
             if query in c["id"].lower()
             or query in c["title"].lower()
-            or query in c.get("victim", "").lower()
-            or query in c["date"]
         ]
     cases_sorted = sorted(cases, key=lambda c: c["date"], reverse=True)
+
+    selected_case = None
+    if cases_sorted:
+        selectable_ids = [c.get("_selector_id") for c in cases_sorted if c.get("_selector_id")]
+        if st.session_state.get("selected_case_id") not in selectable_ids:
+            st.session_state["selected_case_id"] = selectable_ids[0] if selectable_ids else None
+        selected_selector_id = st.session_state.get("selected_case_id")
+        selected_case = next(
+            (c for c in cases_sorted if c.get("_selector_id") == selected_selector_id),
+            None,
+        )
+    else:
+        st.session_state["selected_case_id"] = None
 
     list_col, detail_col = st.columns([1.2, 2.3], gap="large")
 
@@ -483,14 +616,34 @@ def main() -> None:
         if not cases_sorted:
             st.info("No cases match your search.")
         else:
-            for case in cases_sorted:
-                label = f"Case ID: {case.get('id', '-')}   Date: {case.get('date', '-')}"
-                with st.expander(label, expanded=False):
-                    case_full = _load_case_by_id(case.get("id", "")) or case
-                    _render_case_sections(case_full)
+            st.radio(
+                "Saved cases",
+                options=[case.get("_selector_id") for case in cases_sorted if case.get("_selector_id")],
+                format_func=lambda selector_id: _format_case_label(
+                    next(case for case in cases_sorted if case.get("_selector_id") == selector_id)
+                ),
+                key="selected_case_id",
+                label_visibility="collapsed",
+            )
+            selected_case = next(
+                (
+                    c
+                    for c in cases_sorted
+                    if c.get("_selector_id") == st.session_state.get("selected_case_id")
+                ),
+                selected_case,
+            )
 
     with detail_col:
-        st.write("")
+        if selected_case:
+            action_col, _ = st.columns([1, 2.2])
+            with action_col:
+                _render_export_button(selected_case)
+            render_case_details(selected_case)
+        elif cases:
+            st.info("Select a case from the left to view its details.")
+        else:
+            st.info("No saved cases are available.")
 
 
 if __name__ == "__main__":
