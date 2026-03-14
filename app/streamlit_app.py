@@ -24,6 +24,7 @@ from services.auth_service import (
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 CSS_FILE = ASSETS_DIR / "styles.css"
+LOGIN_CSS_FILE = ASSETS_DIR / "login.css"
 
 
 def _encode_image(path: Path) -> tuple[str, str]:
@@ -35,20 +36,16 @@ def _encode_image(path: Path) -> tuple[str, str]:
 def inject_styles() -> None:
     """Load CSS and override login page backgrounds with the local asset if present."""
     css = CSS_FILE.read_text(encoding="utf-8") if CSS_FILE.exists() else ""
+    login_css = LOGIN_CSS_FILE.read_text(encoding="utf-8") if LOGIN_CSS_FILE.exists() else ""
 
     preferred = ASSETS_DIR / "board.jpg"
     fallback = ASSETS_DIR / "board-placeholder.png"
     image_path = preferred if preferred.exists() else fallback
 
     encoded, mime = _encode_image(image_path)
-    hero_override = (
-        ".crime-hero::before {"
-        f"background-image: linear-gradient(180deg, rgba(10,0,0,0.65) 0%, rgba(0,0,0,0.92) 80%), "
-        f"url('data:{mime};base64,{encoded}');"
-        "}"
-    )
+    login_override = f":root {{ --login-bg-image: url('data:{mime};base64,{encoded}'); }}"
 
-    st.markdown(f"<style>{css}\n{hero_override}</style>", unsafe_allow_html=True)
+    st.markdown(f"<style>{css}\n{login_css}\n{login_override}</style>", unsafe_allow_html=True)
 
 
 def hide_sidebar_for_login() -> None:
@@ -66,25 +63,26 @@ def hide_sidebar_for_login() -> None:
     )
 
 
-def render_welcome() -> None:
-    st.markdown(
-        """
-        <section class="crime-hero splash-card">
-            <div>
-                <div class="crime-title">Crime Sense</div>
-                <div class="crime-sub">AI-assisted offender profile predictions</div>
-            </div>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_login_card() -> None:
-    st.markdown('<div id="login-card"></div>', unsafe_allow_html=True)
-    left, center, right = st.columns([1.15, 1, 1.15])
+def render_login_card(notice: str | None, account_count: int | None, config_error: str | None) -> None:
+    left, center, right = st.columns([0.8, 1.45, 0.8])
     with center:
         with st.form("login_panel_form", clear_on_submit=False):
+            st.markdown(
+                """
+                <div class="login-head">
+                    <div class="crime-title">Crime Sense</div>
+                    <div class="crime-sub">AI-assisted offender profile predictions</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if notice:
+                st.info(notice)
+            if config_error:
+                st.error(config_error)
+            # elif account_count is not None:
+            #     st.caption(f"{account_count} login account(s) configured for this app.")
+
             username = st.text_input("", placeholder="username", label_visibility="collapsed", key="user_main")
             password = st.text_input("", placeholder="password", type="password", label_visibility="collapsed", key="pass_main")
             clicked = st.form_submit_button("Log In", use_container_width=True)
@@ -121,16 +119,14 @@ def main() -> None:
 
     inject_styles()
     hide_sidebar_for_login()
-    render_welcome()
-    st.markdown("<div class='login-wrapper-gap'></div>", unsafe_allow_html=True)
     notice = pop_notice()
-    if notice:
-        st.info(notice)
+    account_count: int | None = None
+    config_error: str | None = None
     try:
-        st.caption(f"{auth_user_count()} login account(s) configured for this app.")
+        account_count = auth_user_count()
     except AuthConfigError as err:
-        st.error(str(err))
-    render_login_card()
+        config_error = str(err)
+    render_login_card(notice, account_count, config_error)
 
 
 if __name__ == "__main__":
