@@ -373,33 +373,34 @@ def _render_export_button(case: dict) -> None:
         char if char.isalnum() or char in {"-", "_"} else "_"
         for char in str(case.get("id") or "case")
     )
+    button_col, _ = st.columns([0.22, 0.78])
     if DOCX_AVAILABLE:
-        st.download_button(
-            "Export DOCX",
-            data=build_case_docx(case),
-            file_name=f"{safe_case_id}.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-        )
+        with button_col:
+            st.download_button(
+                "Export DOCX",
+                data=build_case_docx(case),
+                file_name=f"{safe_case_id}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
         return
 
     if PDF_AVAILABLE:
-        st.download_button(
-            "Export PDF",
-            data=build_case_pdf(case),
-            file_name=f"{safe_case_id}.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
+        with button_col:
+            st.download_button(
+                "Export PDF",
+                data=build_case_pdf(case),
+                file_name=f"{safe_case_id}.pdf",
+                mime="application/pdf",
+            )
         return
 
-    st.download_button(
-        "Export RTF",
-        data=build_case_rtf(case),
-        file_name=f"{safe_case_id}.rtf",
-        mime="application/rtf",
-        use_container_width=True,
-    )
+    with button_col:
+        st.download_button(
+            "Export RTF",
+            data=build_case_rtf(case),
+            file_name=f"{safe_case_id}.rtf",
+            mime="application/rtf",
+        )
 
 
 def build_case_docx(case: dict) -> bytes:
@@ -612,41 +613,38 @@ def main() -> None:
     else:
         st.session_state["selected_case_id"] = None
 
-    list_col, detail_col = st.columns([1.2, 2.3], gap="large")
+    st.markdown("**Cases**")
+    if not cases_sorted:
+        st.info("No cases match your search.")
+    else:
+        selectable_ids = [case.get("_selector_id") for case in cases_sorted if case.get("_selector_id")]
+        current_case_id = st.session_state.get("selected_case_id")
+        current_index = selectable_ids.index(current_case_id) if current_case_id in selectable_ids else 0
+        selected_selector_id = st.selectbox(
+            "Saved cases",
+            options=selectable_ids,
+            index=current_index,
+            format_func=lambda selector_id: _format_case_label(
+                next(case for case in cases_sorted if case.get("_selector_id") == selector_id)
+            ),
+        )
+        st.session_state["selected_case_id"] = selected_selector_id
+        selected_case = next(
+            (
+                c
+                for c in cases_sorted
+                if c.get("_selector_id") == selected_selector_id
+            ),
+            selected_case,
+        )
 
-    with list_col:
-        st.markdown("**Cases**")
-        if not cases_sorted:
-            st.info("No cases match your search.")
-        else:
-            st.radio(
-                "Saved cases",
-                options=[case.get("_selector_id") for case in cases_sorted if case.get("_selector_id")],
-                format_func=lambda selector_id: _format_case_label(
-                    next(case for case in cases_sorted if case.get("_selector_id") == selector_id)
-                ),
-                key="selected_case_id",
-                label_visibility="collapsed",
-            )
-            selected_case = next(
-                (
-                    c
-                    for c in cases_sorted
-                    if c.get("_selector_id") == st.session_state.get("selected_case_id")
-                ),
-                selected_case,
-            )
-
-    with detail_col:
-        if selected_case:
-            action_col, _ = st.columns([1, 2.2])
-            with action_col:
-                _render_export_button(selected_case)
-            render_case_details(selected_case)
-        elif cases:
-            st.info("Select a case from the left to view its details.")
-        else:
-            st.info("No saved cases are available.")
+    if selected_case:
+        _render_export_button(selected_case)
+        render_case_details(selected_case)
+    elif cases:
+        st.info("Select a case from the dropdown to view its details.")
+    else:
+        st.info("No saved cases are available.")
 
 
 if __name__ == "__main__":

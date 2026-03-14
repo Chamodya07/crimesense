@@ -34,6 +34,9 @@ def make_json_safe(obj):
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
 
+    if isinstance(obj, (dt.date, dt.datetime, dt.time)):
+        return obj.isoformat()
+
     if np is not None:
         if isinstance(obj, np.integer):
             return int(obj)
@@ -144,11 +147,28 @@ def main() -> None:
             form_data["domestic"] = st.checkbox("Domestic incident", value=False)
         # Time & Date
         with st.expander("Time & Date", expanded=True):
-            form_data["hour"] = st.slider("Hour", 0, 23, 0)
-            auto_night = form_data["hour"] >= 18 or form_data["hour"] <= 5
-            form_data["is_night"] = st.checkbox(
-                "Is night?", value=auto_night, help="Calculated from hour; override if needed."
+            date_col, hour_col, minute_col = st.columns([2, 1, 1])
+            with date_col:
+                form_data["incident_date"] = st.date_input("Date", value=dt.date.today())
+            with hour_col:
+                form_data["incident_hour"] = st.selectbox(
+                    "Hour",
+                    options=list(range(24)),
+                    format_func=lambda value: f"{value:02d}",
+                )
+            with minute_col:
+                form_data["incident_minute"] = st.selectbox(
+                    "Minute",
+                    options=list(range(60)),
+                    format_func=lambda value: f"{value:02d}",
+                )
+
+            form_data["incident_time"] = dt.time(
+                hour=form_data["incident_hour"],
+                minute=form_data["incident_minute"],
             )
+            form_data["hour"] = form_data["incident_hour"]
+            form_data["is_night"] = form_data["hour"] >= 18 or form_data["hour"] <= 5
         # Location coordinates
         with st.expander("Location", expanded=False):
             form_data["latitude"] = st.number_input("Latitude", value=0.0, format="%f")
@@ -234,6 +254,8 @@ def main() -> None:
             "primary_type": inputs.get("primary_type") or inputs.get("crime_type") or inputs.get("type"),
             "location_desc": inputs.get("location_desc") or inputs.get("location") or inputs.get("premise"),
             "weapon_desc": inputs.get("weapon_desc") or inputs.get("weapon"),
+            "incident_date": inputs.get("incident_date"),
+            "incident_time": inputs.get("incident_time"),
             "hour": inputs.get("hour"),
             "is_night": inputs.get("is_night"),
             "arrest": inputs.get("arrest"),
@@ -270,7 +292,7 @@ def main() -> None:
                 if v in ("", None):
                     continue
                 # convert date objects to strings for serialization
-                if isinstance(v, (dt.date, dt.datetime)):
+                if isinstance(v, (dt.date, dt.datetime, dt.time)):
                     v = v.isoformat()
                 model_key = UI_TO_MODEL.get(k, k)
                 raw[model_key] = v
