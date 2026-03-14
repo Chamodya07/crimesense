@@ -12,6 +12,8 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from services.auth_service import render_auth_status
+
 try:
     from docx import Document
 
@@ -563,6 +565,7 @@ def main() -> None:
         initial_sidebar_state="collapsed",
     )
     inject_styles()
+    render_auth_status("history")
 
     if "history_search_input" not in st.session_state:
         st.session_state["history_search_input"] = ""

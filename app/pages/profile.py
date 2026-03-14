@@ -13,6 +13,8 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from services.auth_service import render_auth_status
+
 ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
 CSS_FILE = ASSETS_DIR / "styles.css"
 
@@ -81,6 +83,7 @@ def main() -> None:
         initial_sidebar_state="collapsed",
     )
     inject_styles()
+    render_auth_status("profile")
 
     st.title("Case Profiling")
     st.markdown("Provide structured details about the incident below. You may also paste a full case JSON if you prefer.")

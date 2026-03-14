@@ -13,6 +13,8 @@ __pycache__/
 venv/
 env/
 ENV/
+.conda/
+.conda-*/
 
 # Environment and local secrets
 .env
