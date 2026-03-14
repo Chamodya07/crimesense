@@ -103,9 +103,22 @@ def login_user(user: AuthUser) -> None:
         "role": user.role,
     }
     st.session_state.pop(AUTH_NOTICE_KEY, None)
+    try:
+        from services.audit_service import log_event
+
+        log_event("login", user.username, page="auth")
+    except Exception:
+        pass
 
 
 def logout_user(notice: str = "Signed out.") -> None:
+    username = current_user().username if current_user() is not None else "unknown"
+    try:
+        from services.audit_service import log_event
+
+        log_event("logout", username, page="auth")
+    except Exception:
+        pass
     st.session_state.pop(AUTH_USER_KEY, None)
     st.session_state[AUTH_NOTICE_KEY] = notice
 

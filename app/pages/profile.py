@@ -78,6 +78,44 @@ def inject_styles() -> None:
         st.markdown(f"<style>{CSS_FILE.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
 
 
+def _audit_model_version(fused: dict | None) -> str | None:
+    if not isinstance(fused, dict):
+        return None
+    return (
+        fused.get("model_version")
+        or (fused.get("fusion_meta") or {}).get("version")
+        or None
+    )
+
+
+def _audit_data_version(fused: dict | None) -> str | None:
+    if not isinstance(fused, dict):
+        return None
+    return (
+        fused.get("data_version")
+        or fused.get("rag_index_version")
+        or (fused.get("explanations") or {}).get("data_version")
+        or None
+    )
+
+
+def _log_profile_event(action: str, case_id: str | None, fused: dict | None, meta: dict | None = None) -> None:
+    try:
+        from services.audit_service import get_current_user_label, log_event
+
+        log_event(
+            action=action,
+            user=get_current_user_label(),
+            case_id=case_id,
+            model_ver=_audit_model_version(fused),
+            data_ver=_audit_data_version(fused),
+            page="profile",
+            meta=meta or {},
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Crime Sense | Profile Intake",
@@ -358,6 +396,12 @@ def main() -> None:
             st.session_state["profile_last_case_dict"] = case_dict
             st.session_state["profile_last_narrative"] = narrative
             st.session_state["has_prediction"] = True
+            _log_profile_event(
+                "predict",
+                case_id,
+                fused,
+                {"narrative_present": bool((narrative or "").strip())},
+            )
         else:
             fused = st.session_state.get("profile_last_fused")
             case_dict = st.session_state.get("profile_last_case_dict", {})
@@ -734,6 +778,7 @@ def main() -> None:
 
                     save_case_by_id(case_id, record_payload_safe)
                     st.success(f"Saved to Firebase (record: {case_id}).")
+                    _log_profile_event("save", case_id, fused)
                 except FirebaseConfigError:
                     st.error("Firebase not configured. Add service account JSON to Streamlit secrets.")
                 except Exception as err:  # noqa: BLE001
@@ -741,7 +786,7 @@ def main() -> None:
 
         with export_col:
             export_name = f"profile_record_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
-            st.download_button(
+            export_clicked = st.download_button(
                 "Export",
                 data=json.dumps(record_payload_safe, ensure_ascii=False, indent=2),
                 file_name=export_name,
@@ -749,6 +794,8 @@ def main() -> None:
                 use_container_width=True,
                 key="profile_export_button",
             )
+            if export_clicked:
+                _log_profile_event("export", case_id, fused)
 
         # offender indicators expander with predicted metrics
         with st.expander("Offender Indicators (optional)"):
