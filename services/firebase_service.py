@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import math
+import base64
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -38,7 +40,7 @@ def _load_service_account_dict() -> Dict[str, Any]:
     raise FirebaseConfigError("Firebase not configured. Add service account JSON to Streamlit secrets.")
 
 
-def make_json_safe(obj: Any) -> Any:
+def _firestore_sanitize(obj: Any) -> Any:
     try:
         import numpy as np  # type: ignore
     except Exception:  # noqa: BLE001
@@ -49,43 +51,233 @@ def make_json_safe(obj: Any) -> Any:
     except Exception:  # noqa: BLE001
         pd = None  # type: ignore
 
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-
     if np is not None:
+        if isinstance(obj, np.ndarray):
+            return [_firestore_sanitize(v) for v in obj.tolist()]
         if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.bool_):
-            return bool(obj)
+            obj = int(obj)
+        elif isinstance(obj, np.floating):
+            obj = float(obj)
+        elif isinstance(obj, np.bool_):
+            obj = bool(obj)
 
     if pd is not None:
         if isinstance(obj, pd.Timestamp):
             return obj.isoformat()
         if isinstance(obj, pd.Series):
-            return make_json_safe(obj.to_dict())
+            return _firestore_sanitize(obj.tolist())
         if isinstance(obj, pd.DataFrame):
-            return make_json_safe(obj.to_dict(orient="records"))
+            return _firestore_sanitize(obj.head(50).to_dict(orient="records"))
+        try:
+            if pd.isna(obj):
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+
+    if obj is None:
+        return obj
+
+    if isinstance(obj, (date, datetime, time)):
+        return obj.isoformat()
+
+    if isinstance(obj, bool):
+        return obj
+
+    if isinstance(obj, int):
+        return obj
+
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+
+    if isinstance(obj, str):
+        return obj
+
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        try:
+            return base64.b64encode(bytes(obj)).decode("ascii")
+        except Exception:  # noqa: BLE001
+            return str(obj)
 
     if isinstance(obj, Path):
         return str(obj)
 
     if isinstance(obj, dict):
-        return {str(k): make_json_safe(v) for k, v in obj.items()}
+        return {str(k): _firestore_sanitize(v) for k, v in obj.items()}
 
     if isinstance(obj, (list, tuple, set)):
-        return [make_json_safe(v) for v in obj]
+        return [_firestore_sanitize(v) for v in obj]
 
     if hasattr(obj, "item") and callable(getattr(obj, "item")):
         try:
             item_value = obj.item()
             if item_value is not obj:
-                return make_json_safe(item_value)
+                return _firestore_sanitize(item_value)
         except Exception:  # noqa: BLE001
             pass
 
     return str(obj)
+
+
+def firestore_safe(obj: Any) -> Any:
+    return _firestore_sanitize(obj)
+
+
+def make_json_safe(obj: Any) -> Any:
+    return _firestore_sanitize(obj)
+
+
+def _trim_outputs_for_firestore(outputs: Any) -> Any:
+    safe_outputs = _firestore_sanitize(outputs)
+    if not isinstance(safe_outputs, dict):
+        return {}
+
+    nested_outputs = safe_outputs.get("outputs")
+    nested_outputs = nested_outputs if isinstance(nested_outputs, dict) else {}
+    fusion_meta = safe_outputs.get("fusion_meta")
+    fusion_meta = fusion_meta if isinstance(fusion_meta, dict) else {}
+
+    for blocked_key in ("explanations", "tabular_shap_top", "tabular_top_features", "nlp_topk"):
+        safe_outputs.pop(blocked_key, None)
+        fusion_meta.pop(blocked_key, None)
+
+    reduced = {
+        "final": _firestore_sanitize(safe_outputs.get("final") or nested_outputs.get("final") or {}),
+        "model_version": _firestore_sanitize(
+            safe_outputs.get("model_version") or (safe_outputs.get("meta") or {}).get("model_version") or ""
+        ),
+        "fusion_meta": _firestore_sanitize(fusion_meta),
+    }
+
+    if not isinstance(reduced["final"], dict):
+        reduced["final"] = {}
+    if not isinstance(reduced["fusion_meta"], dict):
+        reduced["fusion_meta"] = {}
+
+    return reduced
+
+
+def _trim_rag_results_for_firestore(rag_results: Any) -> List[Dict[str, Any]]:
+    safe_results = _firestore_sanitize(rag_results)
+    if not isinstance(safe_results, list):
+        return []
+    trimmed: List[Dict[str, Any]] = []
+    for item in safe_results[:10]:
+        if isinstance(item, dict):
+            trimmed.append(item)
+    return trimmed
+
+
+def find_first_firestore_issue_path(obj: Any, path: str = "root") -> str:
+    try:
+        import numpy as np  # type: ignore
+    except Exception:  # noqa: BLE001
+        np = None  # type: ignore
+
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:  # noqa: BLE001
+        pd = None  # type: ignore
+
+    if np is not None:
+        if isinstance(obj, (np.integer, np.floating, np.bool_, np.ndarray)):
+            return f"{path} ({type(obj).__name__})"
+
+    if pd is not None:
+        if isinstance(obj, (pd.Timestamp, pd.Series, pd.DataFrame)):
+            return f"{path} ({type(obj).__name__})"
+        try:
+            if pd.isna(obj):
+                return f"{path} (NaN/NA)"
+        except Exception:  # noqa: BLE001
+            pass
+
+    if obj is None or isinstance(obj, (str, bool, int)):
+        return ""
+
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            return f"{path} (non-finite float)"
+        return ""
+
+    if isinstance(obj, (date, datetime, time, Path)):
+        return ""
+
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return f"{path} ({type(obj).__name__})"
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if not isinstance(key, str):
+                return f"{path}.{key} (non-string key)"
+            child_issue = find_first_firestore_issue_path(value, f"{path}.{key}")
+            if child_issue:
+                return child_issue
+        return ""
+
+    if isinstance(obj, list):
+        for index, value in enumerate(obj):
+            child_issue = find_first_firestore_issue_path(value, f"{path}[{index}]")
+            if child_issue:
+                return child_issue
+        return ""
+
+    if isinstance(obj, (tuple, set)):
+        return f"{path} ({type(obj).__name__})"
+
+    if hasattr(obj, "item") and callable(getattr(obj, "item")):
+        return f"{path} ({type(obj).__name__})"
+
+    return f"{path} ({type(obj).__name__})"
+
+
+def diagnose_firestore_payload_issue(db, collection_name: str, payload: Dict[str, Any]) -> str:
+    del db, collection_name
+
+    try:
+        from google.cloud.firestore_v1 import _helpers
+    except Exception:  # noqa: BLE001
+        return ""
+
+    safe_payload = _firestore_sanitize(payload or {})
+
+    try:
+        _helpers.encode_dict(safe_payload)
+        return "No issue detected"
+    except Exception as exc:  # noqa: BLE001
+        base_error = f"{type(exc).__name__}: {exc}"
+
+    ordered_keys = ["outputs", "rag_results", "inputs", "feedback", "narrative_text", "case_id", "created_at_local"]
+
+    without_outputs = {k: v for k, v in safe_payload.items() if k != "outputs"}
+    try:
+        _helpers.encode_dict(without_outputs)
+        return f"Likely failing top-level key: outputs ({base_error})"
+    except Exception:
+        pass
+
+    outputs_only = {"outputs": safe_payload.get("outputs")}
+    try:
+        _helpers.encode_dict(outputs_only)
+    except Exception as exc:  # noqa: BLE001
+        outputs_value = safe_payload.get("outputs")
+        if isinstance(outputs_value, dict) and "final" in outputs_value:
+            try:
+                _helpers.encode_dict({"outputs": {"final": outputs_value.get("final")}})
+            except Exception as final_exc:  # noqa: BLE001
+                return f"Likely failing path: outputs.final ({type(final_exc).__name__}: {final_exc})"
+        return f"Likely failing top-level key: outputs ({type(exc).__name__}: {exc})"
+
+    keys_to_try = ordered_keys + [k for k in safe_payload.keys() if k not in ordered_keys]
+    for key in keys_to_try:
+        if key not in safe_payload:
+            continue
+        candidate = {str(key): safe_payload[key]}
+        try:
+            _helpers.encode_dict(candidate)
+        except Exception as exc:  # noqa: BLE001
+            return f"Key '{key}' caused error: {type(exc).__name__}: {exc}"
+
+    return f"Payload still failed Firestore encoding: {base_error}"
 
 
 @st.cache_resource(show_spinner=False)
@@ -115,12 +307,17 @@ def save_history_record(record: Dict[str, Any]) -> str:
         ) from exc
 
     db = init_firebase()
-    payload = make_json_safe(record or {})
-    payload.setdefault("created_at_local", datetime.now(timezone.utc).replace(microsecond=0).isoformat())
-    payload["created_at"] = firestore.SERVER_TIMESTAMP
+    record_safe = _firestore_sanitize(record or {})
+    if not isinstance(record_safe, dict):
+        record_safe = {"value": record_safe}
+    record_safe["outputs"] = _trim_outputs_for_firestore((record or {}).get("outputs"))
+    if "rag_results" in record_safe:
+        record_safe["rag_results"] = _trim_rag_results_for_firestore((record or {}).get("rag_results"))
+    record_safe.setdefault("created_at_local", datetime.now(timezone.utc).replace(microsecond=0).isoformat())
+    record_safe["created_at"] = firestore.SERVER_TIMESTAMP
 
-    _, doc_ref = db.collection("history").add(payload)
-    return doc_ref.id
+    doc_ref = db.collection("history").add(record_safe)
+    return doc_ref[1].id
 
 
 def save_case_by_id(case_id: str, record: Dict[str, Any]) -> None:
@@ -136,7 +333,12 @@ def save_case_by_id(case_id: str, record: Dict[str, Any]) -> None:
         raise ValueError("case_id is required for save_case_by_id")
 
     db = init_firebase()
-    payload = make_json_safe(record or {})
+    payload = _firestore_sanitize(record or {})
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+    payload["outputs"] = _trim_outputs_for_firestore((record or {}).get("outputs"))
+    if "rag_results" in payload:
+        payload["rag_results"] = _trim_rag_results_for_firestore((record or {}).get("rag_results"))
     payload["case_id"] = normalized_case_id
     payload.setdefault("created_at_local", datetime.now(timezone.utc).replace(microsecond=0).isoformat())
     payload["created_at"] = firestore.SERVER_TIMESTAMP
@@ -382,7 +584,7 @@ def find_similar_saved_cases(
                 "score": round(float(sim_score), 3),
                 "saved_time": _to_time_text(rec.get("created_at_local") or rec.get("created_at")),
                 "record_id": rec.get("id", ""),
-                "case_id": inputs.get("case_id") or rec.get("id", ""),
+                "case_id": rec.get("case_id") or inputs.get("case_id") or rec.get("id", ""),
                 "type": inputs.get("primary_type") or inputs.get("type") or "",
                 "weapon": inputs.get("weapon_desc") or inputs.get("weapon") or "",
                 "place": inputs.get("location_desc") or inputs.get("place") or "",
@@ -417,7 +619,9 @@ def find_similar_saved_cases(
 __all__ = [
     "FirebaseConfigError",
     "init_firebase",
+    "firestore_safe",
     "make_json_safe",
+    "diagnose_firestore_payload_issue",
     "save_history_record",
     "save_case_by_id",
     "get_case_by_id",

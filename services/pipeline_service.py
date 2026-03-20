@@ -9,6 +9,76 @@ from services.nlp_service import predict_nlp_topk
 from services.tabular_service import predict_tabular
 
 
+def _feature_to_phrase(feat: str, value: Any) -> str:
+    feature = str(feat or "").strip()
+    if feature.startswith("primary_type_"):
+        return f"Crime type: {feature.removeprefix('primary_type_')}"
+    if feature.startswith("location_desc_"):
+        return f"Location: {feature.removeprefix('location_desc_')}"
+    if feature.startswith("weapon_desc_"):
+        return f"Weapon: {feature.removeprefix('weapon_desc_')}"
+    if feature == "is_night":
+        return "Night-time incident"
+    if feature == "hour":
+        return f"Hour: {_safe_scalar(value)}"
+    if feature == "domestic":
+        return "Domestic incident flag"
+    if feature in {"latitude", "longitude"}:
+        return "Geographic location"
+    return feature.replace("_", " ")
+
+
+def _build_tabular_text_expl(explanations: Dict[str, Any]) -> Dict[str, Any]:
+    rows = explanations.get("tabular_shap_top", []) or []
+    if not isinstance(rows, list):
+        return {}
+
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        feature = str(row.get("feature", "") or "").strip()
+        if not feature:
+            continue
+        value = _safe_scalar(row.get("value"))
+        try:
+            shap = float(_safe_scalar(row.get("shap", 0.0)) or 0.0)
+        except Exception:  # noqa: BLE001
+            shap = 0.0
+        normalized_rows.append(
+            {
+                "feature": feature,
+                "value": value,
+                "shap": shap,
+                "phrase": _feature_to_phrase(feature, value),
+            }
+        )
+
+    if not normalized_rows:
+        return {}
+
+    sorted_rows = sorted(normalized_rows, key=lambda row: abs(row["shap"]), reverse=True)
+    up_rows = [row for row in sorted_rows if row["shap"] > 0][:3]
+    down_rows = [row for row in sorted_rows if row["shap"] < 0][:2]
+
+    drivers_up = [f"{row['phrase']} (+{row['shap']:.2f} impact)" for row in up_rows]
+    drivers_down = [f"{row['phrase']} ({row['shap']:.2f} impact)" for row in down_rows]
+
+    up_phrases = [row["phrase"] for row in up_rows[:2]]
+    down_phrase = down_rows[0]["phrase"] if down_rows else "no strong opposing factors"
+
+    summary = (
+        f"Main factors increasing the prediction: {', '.join(up_phrases) if up_phrases else 'none identified'}. "
+        f"Factors decreasing it: {down_phrase}."
+    )
+
+    return {
+        "summary": str(summary),
+        "drivers_up": [str(item) for item in drivers_up],
+        "drivers_down": [str(item) for item in drivers_down],
+    }
+
+
 def run_profile(
     case_dict: Dict[str, Any],
     narrative_text: Optional[str] = None,
@@ -39,14 +109,36 @@ def run_profile(
             motive_key = "motive"
 
     nlp_out = predict_nlp_topk(narrative_text or "", top_k=nlp_top_k)
-    # ``nlp_out`` is either None or a dict with topk/pred/confidence
-    topk_list = nlp_out.get("topk") if isinstance(nlp_out, dict) else None
 
-    fused = late_fusion_predict(tab_out, shap_top, topk_list, motive_key=motive_key)
+    fused = late_fusion_predict(tab_out, shap_top, nlp_out, motive_key=motive_key)
+
+    explanations = fused.get("explanations")
+    if not isinstance(explanations, dict):
+        explanations = {}
+        fused["explanations"] = explanations
+
+    tabular_explanations = tab_out.get("explanations") if isinstance(tab_out, dict) else {}
+    if isinstance(tabular_explanations, dict):
+        existing_rows = explanations.get("tabular_shap_top", []) or []
+        tabular_rows = tabular_explanations.get("tabular_shap_top", []) or []
+        if not existing_rows and tabular_rows:
+            explanations["tabular_shap_top"] = tabular_rows
+
+    if isinstance(nlp_out, dict):
+        explanations["nlp_topk"] = nlp_out.get("topk", []) or []
+        explanations["nlp_pred"] = nlp_out.get("pred", "") or ""
+        explanations["nlp_confidence"] = float(nlp_out.get("confidence", 0.0) or 0.0)
+    else:
+        explanations["nlp_topk"] = []
+        explanations["nlp_pred"] = ""
+        explanations["nlp_confidence"] = 0.0
 
     # Attach raw outputs for storage/audit
     fused["_tabular_output"] = tab_out
     fused["_nlp_output"] = nlp_out or {}
+
+    if explanations.get("tabular_shap_top") and not explanations.get("tabular_text_expl"):
+        explanations["tabular_text_expl"] = _build_tabular_text_expl(explanations)
 
     return fused
 
@@ -59,6 +151,10 @@ def _text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip().lower()
+
+
+def _normalize(value: Any) -> str:
+    return _text(value)
 
 
 def _location_keyword(value: Any) -> str:
@@ -116,17 +212,32 @@ def _safe_scalar(value: Any) -> Any:
     return value
 
 
+def _hour_value(value: Any) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(float(value))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _saved_primary_type(saved_record: Dict[str, Any]) -> str:
+    inputs = saved_record.get("inputs") or {}
+    if isinstance(inputs, dict):
+        return _normalize(inputs.get("primary_type"))
+    return ""
+
+
+def _current_primary_type(current_case_dict: Dict[str, Any]) -> str:
+    return _normalize((current_case_dict or {}).get("primary_type"))
+
+
 def _simple_saved_similarity(current_case_dict: Dict[str, Any], saved_record: Dict[str, Any]) -> float:
     inputs = saved_record.get("inputs") or {}
     if not isinstance(inputs, dict):
         return 0.0
 
     score = 0.0
-
-    cur_type = _text(current_case_dict.get("primary_type"))
-    rec_type = _text(inputs.get("primary_type") or inputs.get("type"))
-    if cur_type and rec_type and cur_type == rec_type:
-        score += 2.0
 
     cur_weapon = _text(current_case_dict.get("weapon_desc"))
     rec_weapon = _text(inputs.get("weapon_desc") or inputs.get("weapon"))
@@ -158,6 +269,13 @@ def get_evidence_bundle(
     rag_results: List[Dict[str, Any]] = []
     saved_results: List[Dict[str, Any]] = []
     warnings: List[str] = []
+    saved_debug: Dict[str, Any] = {
+        "cur_type_raw": "",
+        "cur_type": "",
+        "saved_types_sample": [],
+        "same_type_records": 0,
+        "total_records": 0,
+    }
 
     try:
         from services.rag_service import retrieve_similar_cases
@@ -173,8 +291,39 @@ def get_evidence_bundle(
         from services.firebase_service import list_history_records
 
         records = list_history_records(limit=200)
+        cur_type_raw = (case_dict or {}).get("primary_type")
+        cur_type = _current_primary_type(case_dict or {})
+        saved_types_sample = [_saved_primary_type(rec or {}) for rec in records[:10]]
+        saved_debug = {
+            "cur_type_raw": cur_type_raw,
+            "cur_type": cur_type,
+            "saved_types_sample": saved_types_sample,
+            "same_type_records": 0,
+            "total_records": len(records),
+        }
+
+        if not cur_type or cur_type in {"unknown", ""}:
+            saved_results = []
+            warnings.append("No similar saved cases found.")
+            return {
+                "rag_results": rag_results,
+                "saved_similar": saved_results,
+                "warnings": warnings,
+                "rag": rag_results,
+                "rag_message": "; ".join([w for w in warnings if "RAG" in w or "rag" in w]) or None,
+                "saved": saved_results,
+                "saved_message": "; ".join([w for w in warnings if "saved" in w.lower() or "firebase" in w.lower()]) or None,
+                "saved_debug": saved_debug,
+            }
+
+        same_type_records = [
+            rec
+            for rec in records
+            if _saved_primary_type(rec or {}) and _saved_primary_type(rec or {}) == cur_type
+        ]
+        saved_debug["same_type_records"] = len(same_type_records)
         scored: List[Dict[str, Any]] = []
-        for rec in records:
+        for rec in same_type_records:
             score = _simple_saved_similarity(case_dict or {}, rec or {})
             if score <= 0:
                 continue
@@ -191,7 +340,7 @@ def get_evidence_bundle(
                     "score": round(float(score), 3),
                     "saved_time": str(rec.get("created_at_local") or rec.get("created_at") or ""),
                     "record_id": rec.get("id", ""),
-                    "type": inputs.get("primary_type") or inputs.get("type") or "",
+                    "type": inputs.get("primary_type") or "",
                     "weapon": inputs.get("weapon_desc") or inputs.get("weapon") or "",
                     "place": inputs.get("location_desc") or inputs.get("place") or "",
                     "area": inputs.get("area") or inputs.get("city") or "",
@@ -231,6 +380,7 @@ def get_evidence_bundle(
         "rag_message": rag_message,
         "saved": saved_results,
         "saved_message": saved_message,
+        "saved_debug": saved_debug,
     }
 
 

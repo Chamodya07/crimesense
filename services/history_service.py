@@ -179,7 +179,7 @@ def _base_ui_case(
     }
 
 
-def _firebase_record_to_ui_case(rec: dict[str, Any]) -> dict[str, Any]:
+def firebase_record_to_ui_case(rec: dict[str, Any]) -> dict[str, Any]:
     outputs = (
         rec.get("outputs")
         or rec.get("fused")
@@ -251,7 +251,7 @@ def load_history_cases(limit: int = 50) -> list[dict[str, Any]]:
 
         records = list_history_records(limit=limit)
         if records:
-            return [_firebase_record_to_ui_case(record) for record in records]
+            return [firebase_record_to_ui_case(record) for record in records]
     except Exception:
         pass
 
@@ -270,4 +270,4 @@ def load_history_cases(limit: int = 50) -> list[dict[str, Any]]:
     return [_storage_record_to_ui_case(case) for case in sorted_cases[:limit]]
 
 
-__all__ = ["load_history_cases", "make_json_safe"]
+__all__ = ["load_history_cases", "firebase_record_to_ui_case", "make_json_safe"]

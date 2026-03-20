@@ -206,6 +206,131 @@ def prepare_tabular_row(case_dict: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
     return row, summary
 
 
+def _python_scalar(value: Any) -> Any:
+    try:
+        import numpy as np  # type: ignore
+    except Exception:  # noqa: BLE001
+        np = None  # type: ignore
+
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:  # noqa: BLE001
+        pd = None  # type: ignore
+
+    if np is not None and isinstance(value, np.generic):
+        return value.item()
+    if pd is not None and isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return value
+
+
+def _build_tabular_shap_top(
+    models: Dict[str, Any],
+    targets: List[str],
+    df: Any,
+) -> List[Dict[str, Any]]:
+    shap_target = "risk_level" if "risk_level" in targets else (targets[0] if targets else "")
+    if not shap_target:
+        return []
+
+    clf = models.get(shap_target)
+    if clf is None or not hasattr(clf, "get_booster"):
+        return []
+
+    try:
+        import numpy as np  # type: ignore
+        import xgboost as xgb  # type: ignore
+
+        booster = clf.get_booster()
+        dmatrix = xgb.DMatrix(df.values, feature_names=list(df.columns))
+        contribs = booster.predict(dmatrix, pred_contribs=True)
+        contribs_array = np.asarray(contribs)
+        if contribs_array.ndim == 3:
+            pred_idx = int(clf.predict(df.values)[0])
+            shap_values = contribs_array[0, pred_idx, :-1]
+        elif contribs_array.ndim == 2:
+            shap_values = contribs_array[0, :-1]
+        else:
+            return []
+
+        feature_values = df.iloc[0].to_dict()
+        ranked: List[Dict[str, Any]] = []
+        for feature_name, shap_value in zip(df.columns, shap_values):
+            shap_float = float(_python_scalar(shap_value) or 0.0)
+            if shap_float == 0.0:
+                continue
+            value = _python_scalar(feature_values.get(feature_name))
+            ranked.append(
+                {
+                    "feature": str(feature_name),
+                    "value": _python_scalar(value),
+                    "shap": shap_float,
+                    "direction": "+" if shap_float >= 0 else "-",
+                }
+            )
+
+        ranked.sort(key=lambda item: abs(float(item.get("shap", 0.0))), reverse=True)
+        return ranked[:12]
+    except Exception:
+        return []
+
+
+def _humanize_shap_feature(feature_name: str) -> str:
+    text = str(feature_name or "").strip()
+    if not text:
+        return "Unknown factor"
+    if text.startswith("primary_type_"):
+        return f"Crime type is {text.split('primary_type_', 1)[1]}"
+    if text.startswith("location_desc_"):
+        return f"Location is {text.split('location_desc_', 1)[1]}"
+    if text.startswith("weapon_desc_"):
+        return f"Weapon involves {text.split('weapon_desc_', 1)[1]}"
+    if text == "is_night":
+        return "Incident occurred at night"
+    if text == "domestic":
+        return "Domestic incident flagged"
+    if text in {"latitude", "longitude"}:
+        return "Geographic location (lat/lon)"
+    return text.replace("_", " ").strip().capitalize()
+
+
+def shap_to_natural_language(
+    shap_rows: List[Dict[str, Any]],
+    target_name: str | None = None,
+) -> Dict[str, Any]:
+    rows = sorted(
+        shap_rows or [],
+        key=lambda item: abs(float(_python_scalar(item.get("shap", 0.0)) or 0.0)),
+        reverse=True,
+    )
+    target_label = str(target_name or "prediction").replace("_", " ")
+    drivers_up: List[str] = []
+    drivers_down: List[str] = []
+
+    for row in rows:
+        feature_label = _humanize_shap_feature(str(row.get("feature", "")))
+        shap_value = float(_python_scalar(row.get("shap", 0.0)) or 0.0)
+        bullet = f"{feature_label} ({shap_value:+.2f} impact)"
+        if shap_value > 0 and len(drivers_up) < 3:
+            drivers_up.append(bullet)
+        elif shap_value < 0 and len(drivers_down) < 2:
+            drivers_down.append(bullet)
+
+    if rows:
+        summary = (
+            f"The tabular model based the {target_label} prediction mainly on the strongest SHAP drivers below. "
+            f"Positive SHAP values pushed the prediction upward, while negative values pulled it down."
+        )
+    else:
+        summary = "No tabular SHAP explanation was available for this prediction."
+
+    return {
+        "summary": summary,
+        "drivers_up": drivers_up,
+        "drivers_down": drivers_down,
+    }
+
+
 def predict_tabular(case_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Run tabular model inference for a single case dictionary.
 
@@ -264,12 +389,21 @@ def predict_tabular(case_dict: Dict[str, Any]) -> Dict[str, Any]:
                     label = str(num)
                 pred_dict[tgt] = label
 
+            shap_top = _build_tabular_shap_top(models, targets, df)
+            target_name = "risk_level" if "risk_level" in targets else (targets[0] if targets else None)
+            tabular_text_expl = shap_to_natural_language(shap_top, target_name=target_name)
+
             output: Dict[str, Any] = {
                 "pred": pred_dict,
                 "meta": {"targets": targets, "features": features, "source": "tabular"},
                 "model_version": version,
                 "raw_features": case_dict,
                 "input_summary": row_summary,
+                "shap_top": [(item["feature"], item["value"]) for item in shap_top],
+                "explanations": {
+                    "tabular_shap_top": shap_top,
+                    "tabular_text_expl": tabular_text_expl,
+                },
             }
             return output
 
@@ -313,6 +447,10 @@ def predict_tabular(case_dict: Dict[str, Any]) -> Dict[str, Any]:
             "model_version": version,
             "raw_features": case_dict,
             "input_summary": row_summary,
+            "explanations": {
+                "tabular_shap_top": [],
+                "tabular_text_expl": shap_to_natural_language([], target_name="risk_level"),
+            },
         }
         return output
 
@@ -323,4 +461,10 @@ def predict_tabular(case_dict: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
 
-__all__ = ["ModelNotAvailableError", "load_tabular_model", "prepare_tabular_row", "predict_tabular"]
+__all__ = [
+    "ModelNotAvailableError",
+    "load_tabular_model",
+    "prepare_tabular_row",
+    "predict_tabular",
+    "shap_to_natural_language",
+]

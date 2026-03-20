@@ -62,11 +62,18 @@ def predict_nlp_topk(text: str, top_k: int = 5) -> Optional[Dict[str, Any]]:
         return None
 
     def format_output(lst: List[Dict[str, Any]]) -> Dict[str, Any]:
-        if not lst:
+        normalized = [
+            {
+                "label": str(item.get("label", "")),
+                "prob": float(item.get("prob", 0.0) or 0.0),
+            }
+            for item in lst
+        ]
+        if not normalized:
             return {"topk": [], "pred": "", "confidence": 0.0}
-        pred = lst[0].get("label", "")
-        conf = float(lst[0].get("prob", 0.0) or 0.0)
-        return {"topk": lst, "pred": pred, "confidence": conf}
+        pred = normalized[0].get("label", "")
+        conf = float(normalized[0].get("prob", 0.0) or 0.0)
+        return {"topk": normalized, "pred": pred, "confidence": conf}
 
     try:
         # ensure model artefacts exist; may raise ModelNotAvailableError

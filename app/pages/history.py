@@ -13,6 +13,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from services.auth_service import render_auth_status
+from services.firebase_service import list_history_records
 from services.history_service import load_history_cases
 
 try:
@@ -65,7 +66,12 @@ def _to_time_text(value: object) -> str:
 
 def seed_cases():
     """Backend-connected case loader."""
-    return load_history_cases(limit=50)
+    raw_records = []
+    try:
+        raw_records = list_history_records(limit=50)
+    except Exception:
+        raw_records = []
+    return raw_records, load_history_cases(limit=50)
 
 
 def _format_case_label(case: dict) -> str:
@@ -399,7 +405,9 @@ def main() -> None:
         with x_col:
             st.button("X", help="Clear search and show all cases", on_click=clear_search, key="clear_history_search")
 
-    cases = seed_cases()
+    raw_records, all_cases = seed_cases()
+    st.caption(f"Fetched {len(raw_records)} history records")
+    cases = list(all_cases)
     query = st.session_state.get("history_search_input", "").strip().lower()
     if query:
         cases = [
@@ -424,7 +432,9 @@ def main() -> None:
         st.session_state["selected_case_id"] = None
 
     st.markdown("**Cases**")
-    if not cases_sorted:
+    if not all_cases:
+        st.info("No saved cases yet.")
+    elif not cases_sorted:
         st.info("No cases match your search.")
     else:
         selectable_ids = [case.get("_selector_id") for case in cases_sorted if case.get("_selector_id")]
@@ -454,7 +464,7 @@ def main() -> None:
     elif cases:
         st.info("Select a case from the dropdown to view its details.")
     else:
-        st.info("No saved cases are available.")
+        st.info("No saved cases yet.")
 
 
 if __name__ == "__main__":

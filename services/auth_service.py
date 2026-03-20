@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 from dataclasses import dataclass
-from typing import Any
 
 import streamlit as st
 
@@ -12,9 +9,11 @@ LOGIN_PAGE = "streamlit_app.py"
 DEFAULT_PAGE = "pages/dashboard.py"
 AUTH_USER_KEY = "auth_user"
 AUTH_NOTICE_KEY = "auth_notice"
+AUTH_FLAG_KEY = "authenticated"
+AUTH_USERNAME_KEY = "user"
 
 
-class AuthConfigError(RuntimeError):
+class AuthConfigError(Exception):
     pass
 
 
@@ -25,111 +24,205 @@ class AuthUser:
     role: str
 
 
-def _read_secret(container: Any, key: str, default: Any = None) -> Any:
-    if container is None:
-        return default
+def _init_auth_state() -> None:
+    if AUTH_FLAG_KEY not in st.session_state:
+        st.session_state[AUTH_FLAG_KEY] = False
+    if AUTH_USERNAME_KEY not in st.session_state:
+        st.session_state[AUTH_USERNAME_KEY] = None
+
+
+def _normalize_username(username: str) -> str:
+    return str(username or "").strip().lower()
+
+
+def _normalize_role(role: str) -> str:
+    normalized = str(role or "").strip().lower()
+    if normalized not in {"user", "admin"}:
+        raise ValueError("Account type must be either 'user' or 'admin'.")
+    return normalized
+
+
+def _load_bcrypt():
     try:
-        return container[key]
-    except Exception:
-        return getattr(container, key, default)
-
-
-def _configured_users() -> list[dict[str, str]]:
-    auth_section = _read_secret(st.secrets, "auth")
-    raw_users = _read_secret(auth_section, "users", [])
-    users: list[dict[str, str]] = []
-
-    for raw in raw_users or []:
-        username = str(_read_secret(raw, "username", "")).strip()
-        if not username:
-            continue
-        users.append(
-            {
-                "username": username,
-                "display_name": str(
-                    _read_secret(raw, "display_name", _read_secret(raw, "name", username))
-                ).strip()
-                or username,
-                "role": str(_read_secret(raw, "role", "user")).strip() or "user",
-                "password": str(_read_secret(raw, "password", "")).strip(),
-                "password_sha256": str(_read_secret(raw, "password_sha256", "")).strip().lower(),
-            }
-        )
-
-    if not users:
+        import bcrypt
+    except ImportError as exc:
         raise AuthConfigError(
-            "No auth users configured. Add [auth] users to .streamlit/secrets.toml."
-        )
+            "bcrypt is not installed. Add it to requirements and install dependencies."
+        ) from exc
+    return bcrypt
 
-    return users
+
+def _load_firestore():
+    from services.firebase_service import FirebaseConfigError, init_firebase
+
+    try:
+        return init_firebase()
+    except FirebaseConfigError as exc:
+        raise AuthConfigError(str(exc)) from exc
+
+
+def _get_firestore_user(username: str) -> dict | None:
+    document_id = str(username or "").strip()
+    if not document_id:
+        return None
+
+    db = _load_firestore()
+    snapshot = db.collection("users").document(document_id).get()
+    if not snapshot.exists:
+        return None
+    return {"id": snapshot.id, **(snapshot.to_dict() or {})}
 
 
 def auth_user_count() -> int:
-    return len(_configured_users())
+    try:
+        user_count = sum(1 for _ in _load_firestore().collection("users").stream())
+    except AuthConfigError as exc:
+        raise AuthConfigError(str(exc)) from exc
+
+    if user_count == 0:
+        raise AuthConfigError("No auth users found in Firestore collection 'users'.")
+    return user_count
 
 
-def _password_matches(candidate: str, configured: dict[str, str]) -> bool:
-    plain = configured.get("password", "")
-    hashed = configured.get("password_sha256", "")
-    if hashed:
-        candidate_hash = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
-        return hmac.compare_digest(candidate_hash, hashed)
-    if plain:
-        return hmac.compare_digest(candidate, plain)
-    return False
+def _password_matches_hash(candidate: str, password_hash: str) -> bool:
+    return verify_password(candidate, password_hash)
+
+
+def hash_password(pw: str) -> str:
+    if not pw:
+        raise ValueError("Password is required.")
+
+    bcrypt = _load_bcrypt()
+    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(pw: str, password_hash: str) -> bool:
+    if not pw or not password_hash:
+        return False
+
+    bcrypt = _load_bcrypt()
+    try:
+        return bool(bcrypt.checkpw(pw.encode("utf-8"), password_hash.encode("utf-8")))
+    except ValueError:
+        return False
 
 
 def authenticate_user(username: str, password: str) -> AuthUser | None:
-    normalized = username.strip().lower()
-    if not normalized or not password:
+    document_id = str(username or "").strip()
+    if not document_id or not password:
         return None
 
-    for user in _configured_users():
-        if user["username"].strip().lower() != normalized:
-            continue
-        if _password_matches(password, user):
-            return AuthUser(
-                username=user["username"],
-                display_name=user["display_name"],
-                role=user["role"],
-            )
+    firestore_user = _get_firestore_user(document_id)
+    if firestore_user is None:
+        return None
+
+    if _password_matches_hash(password, str(firestore_user.get("password_hash", "")).strip()):
+        stored_username = str(firestore_user.get("username") or firestore_user.get("id") or "").strip()
+        return AuthUser(
+            username=stored_username or str(username).strip(),
+            display_name=stored_username or str(username).strip(),
+            role=str(firestore_user.get("role", "user")).strip() or "user",
+        )
     return None
 
 
+def user_exists(username: str) -> bool:
+    document_id = str(username or "").strip()
+    if not document_id:
+        return False
+
+    db = _load_firestore()
+    return bool(db.collection("users").document(document_id).get().exists)
+
+
+def create_user(username: str, password: str, role: str = "user") -> str:
+    document_id = str(username or "").strip()
+    if not document_id:
+        raise ValueError("Username is required.")
+    if len(password or "") < 8:
+        raise ValueError("Password must be at least 8 characters long.")
+    if user_exists(document_id):
+        raise ValueError("User already exists")
+    account_role = _normalize_role(role)
+
+    db = _load_firestore()
+
+    try:
+        from firebase_admin import firestore
+    except ImportError as exc:
+        raise AuthConfigError(
+            "firebase-admin is not installed. Add it to requirements and install dependencies."
+        ) from exc
+
+    password_hash = hash_password(password)
+    payload = {
+        "username": document_id,
+        "password_hash": password_hash,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "role": account_role,
+    }
+
+    try:
+        db.collection("users").document(document_id).create(payload)
+    except Exception as exc:
+        if user_exists(document_id):
+            raise ValueError("User already exists") from exc
+        raise
+    return document_id
+
+
+def verify_user(username: str, password: str) -> bool:
+    return authenticate_user(username, password) is not None
+
+
 def login_user(user: AuthUser) -> None:
+    _init_auth_state()
     st.session_state[AUTH_USER_KEY] = {
         "username": user.username,
         "display_name": user.display_name,
         "role": user.role,
     }
+    st.session_state[AUTH_FLAG_KEY] = True
+    st.session_state[AUTH_USERNAME_KEY] = user.username
     st.session_state.pop(AUTH_NOTICE_KEY, None)
     try:
         from services.audit_service import log_event
 
-        log_event("login", user.username, page="auth")
+        log_event("login", page="auth")
     except Exception:
         pass
 
 
 def logout_user(notice: str = "Signed out.") -> None:
-    username = current_user().username if current_user() is not None else "unknown"
     try:
         from services.audit_service import log_event
 
-        log_event("logout", username, page="auth")
+        log_event("logout", page="auth")
     except Exception:
         pass
+
+    _init_auth_state()
     st.session_state.pop(AUTH_USER_KEY, None)
+    st.session_state[AUTH_FLAG_KEY] = False
+    st.session_state[AUTH_USERNAME_KEY] = None
     st.session_state[AUTH_NOTICE_KEY] = notice
+    st.rerun()
 
 
 def current_user() -> AuthUser | None:
+    _init_auth_state()
+    if not st.session_state.get(AUTH_FLAG_KEY):
+        return None
+
     payload = st.session_state.get(AUTH_USER_KEY)
     if not isinstance(payload, dict):
         return None
+
     username = str(payload.get("username", "")).strip()
     if not username:
         return None
+
+    st.session_state[AUTH_USERNAME_KEY] = username
     return AuthUser(
         username=username,
         display_name=str(payload.get("display_name", username)).strip() or username,
@@ -138,7 +231,8 @@ def current_user() -> AuthUser | None:
 
 
 def is_authenticated() -> bool:
-    return current_user() is not None
+    _init_auth_state()
+    return bool(st.session_state.get(AUTH_FLAG_KEY)) and current_user() is not None
 
 
 def pop_notice() -> str | None:
@@ -166,6 +260,33 @@ def render_auth_status(key_suffix: str) -> AuthUser:
     with action_col:
         if st.button("Logout", key=f"logout_{key_suffix}", use_container_width=True):
             logout_user()
-            st.switch_page(LOGIN_PAGE)
             st.stop()
     return user
+
+
+__all__ = [
+    "AuthConfigError",
+    "AuthUser",
+    "LOGIN_PAGE",
+    "DEFAULT_PAGE",
+    "AUTH_USER_KEY",
+    "AUTH_NOTICE_KEY",
+    "auth_user_count",
+    "authenticate_user",
+    "hash_password",
+    "verify_password",
+    "user_exists",
+    "create_user",
+    "verify_user",
+    "login_user",
+    "logout_user",
+    "current_user",
+    "is_authenticated",
+    "pop_notice",
+    "require_auth",
+    "render_auth_status",
+]
+
+
+if __name__ == "__main__":
+    print("exports:", "create_user" in globals(), "user_exists" in globals())

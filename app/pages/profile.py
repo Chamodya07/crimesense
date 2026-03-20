@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 
 import streamlit as st
+from config import MODELS
 
 # Ensure project root is on path for backend imports
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -78,34 +79,99 @@ def inject_styles() -> None:
         st.markdown(f"<style>{CSS_FILE.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
 
 
-def _audit_model_version(fused: dict | None) -> str | None:
-    if not isinstance(fused, dict):
+def _read_json_file(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _artifact_mtime_text(path: Path) -> str | None:
+    try:
+        if not path.exists():
+            return None
+        return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc).replace(microsecond=0).isoformat()
+    except Exception:
         return None
-    return (
-        fused.get("model_version")
-        or (fused.get("fusion_meta") or {}).get("version")
-        or None
-    )
+
+
+def _resolve_tabular_data_version() -> str | None:
+    candidates = [
+        _ROOT / "artifacts" / "tabular" / "portable" / "model_meta.json",
+        _ROOT / "artifacts" / "tabular" / "crimesense_tabular_only" / "model_meta.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        meta = _read_json_file(path)
+        version = (
+            meta.get("data_version")
+            or meta.get("dataset_version")
+            or meta.get("last_updated")
+            or _artifact_mtime_text(path)
+        )
+        if version not in (None, ""):
+            return str(version)
+    return None
+
+
+def _resolve_rag_data_version() -> str | None:
+    meta_path = _ROOT / "artifacts" / "rag" / "meta.json"
+    if meta_path.exists():
+        meta = _read_json_file(meta_path)
+        version = meta.get("built_at") or _artifact_mtime_text(meta_path)
+        if version not in (None, ""):
+            return str(version)
+
+    for fallback in (
+        _ROOT / "artifacts" / "rag" / "faiss.index",
+        _ROOT / "artifacts" / "rag" / "cases.csv",
+    ):
+        version = _artifact_mtime_text(fallback)
+        if version not in (None, ""):
+            return str(version)
+    return None
+
+
+def _audit_model_version(fused: dict | None) -> str | None:
+    if isinstance(fused, dict):
+        value = fused.get("model_version") or (fused.get("fusion_meta") or {}).get("version")
+        if value not in (None, ""):
+            return str(value)
+    fallback = getattr(MODELS, "MODEL_VERSION", None) or getattr(MODELS, "fusion_version", None)
+    return str(fallback) if fallback not in (None, "") else None
 
 
 def _audit_data_version(fused: dict | None) -> str | None:
-    if not isinstance(fused, dict):
-        return None
-    return (
-        fused.get("data_version")
-        or fused.get("rag_index_version")
-        or (fused.get("explanations") or {}).get("data_version")
-        or None
-    )
+    tab_ver = _resolve_tabular_data_version()
+    rag_ver = _resolve_rag_data_version()
+
+    parts = []
+    if tab_ver:
+        parts.append(f"tab:{tab_ver}")
+    if rag_ver:
+        parts.append(f"rag:{rag_ver}")
+
+    if parts:
+        return " | ".join(parts)
+
+    if isinstance(fused, dict):
+        fallback = (
+            fused.get("data_version")
+            or fused.get("rag_index_version")
+            or (fused.get("explanations") or {}).get("data_version")
+        )
+        if fallback not in (None, ""):
+            return str(fallback)
+    return None
 
 
 def _log_profile_event(action: str, case_id: str | None, fused: dict | None, meta: dict | None = None) -> None:
     try:
-        from services.audit_service import get_current_user_label, log_event
+        from services.audit_service import log_event
 
         log_event(
             action=action,
-            user=get_current_user_label(),
             case_id=case_id,
             model_ver=_audit_model_version(fused),
             data_ver=_audit_data_version(fused),
@@ -491,6 +557,8 @@ def main() -> None:
         sim_cases: list = []
         saved_sim_cases: list = []
         saved_message: str | None = None
+        saved_message_level = "info"
+        saved_debug: dict = {}
 
         def _pick_case_value(source: dict, *keys: str):
             for key in keys:
@@ -505,6 +573,28 @@ def main() -> None:
             if text.lower() in {"", "unknown", "none", "nan"}:
                 return ""
             return text
+
+        def _normalize_saved_value(value):
+            return str(value or "").strip().lower()
+
+        def _saved_location_keyword(value):
+            text = _normalize_saved_value(value)
+            if not text:
+                return ""
+            for keyword in ["street", "residence", "apartment", "house", "business", "store", "park", "school"]:
+                if keyword in text:
+                    return keyword
+            return text
+
+        def _saved_bool(value):
+            if isinstance(value, bool):
+                return value
+            text = _normalize_saved_value(value)
+            if text in {"true", "1", "yes", "y"}:
+                return True
+            if text in {"false", "0", "no", "n"}:
+                return False
+            return None
 
         raw_primary = _pick_case_value(case_dict, "primary_type", "crime_type", "type")
         primary_type = _clean_text_value(raw_primary)
@@ -580,24 +670,98 @@ def main() -> None:
 
         try:
             from services.pipeline_service import get_evidence_bundle
+            from services.firebase_service import list_history_records
 
             evidence_bundle = get_evidence_bundle(rag_case_dict, narrative, fused_output=fused, top_k=5)
             sim_cases = evidence_bundle.get("rag", []) or evidence_bundle.get("rag_results", []) or []
             rag_message = evidence_bundle.get("rag_message")
-            saved_sim_cases = evidence_bundle.get("saved", []) or evidence_bundle.get("saved_similar", []) or []
-            saved_message = evidence_bundle.get("saved_message")
             warning_list = evidence_bundle.get("warnings", []) or []
             if not rag_message:
                 rag_warns = [w for w in warning_list if "rag" in str(w).lower()]
                 rag_message = "; ".join(rag_warns) if rag_warns else None
-            if not saved_message:
-                saved_warns = [w for w in warning_list if "saved" in str(w).lower() or "firebase" in str(w).lower()]
-                saved_message = "; ".join(saved_warns) if saved_warns else None
+
+            cur_type_raw = case_dict.get("primary_type")
+            cur_type = _normalize_saved_value(cur_type_raw)
+            saved_records = list_history_records(limit=200)
+            observed_types: list[str] = []
+            same_type_records: list[dict] = []
+            for rec in saved_records:
+                saved_inputs = rec.get("inputs") or {}
+                saved_type = _normalize_saved_value(saved_inputs.get("primary_type"))
+                if len(observed_types) < 10:
+                    observed_types.append(saved_type)
+                if not saved_type:
+                    continue
+                if saved_type == cur_type:
+                    same_type_records.append(rec)
+
+            saved_debug = {
+                "cur_type_raw": cur_type_raw,
+                "cur_type": cur_type,
+                "total_records": len(saved_records),
+                "same_type_records": len(same_type_records),
+                "saved_types_sample": observed_types,
+            }
+
+            if not cur_type or cur_type == "unknown":
+                saved_sim_cases = []
+                saved_message = "Select a Primary type to see similar saved cases."
+                saved_message_level = "info"
+            else:
+                scored_saved_cases = []
+                for rec in same_type_records:
+                    saved_inputs = rec.get("inputs") or {}
+                    outputs = rec.get("outputs") or rec.get("fused_output") or rec.get("fusion_output") or {}
+                    final_saved = outputs.get("final", {}) if isinstance(outputs, dict) else {}
+                    motive_obj = final_saved.get("motive", {})
+                    motive = motive_obj.get("pred") if isinstance(motive_obj, dict) else motive_obj
+
+                    score = 1.0
+                    if _normalize_saved_value(saved_inputs.get("weapon_desc")) == _normalize_saved_value(case_dict.get("weapon_desc")):
+                        if _normalize_saved_value(case_dict.get("weapon_desc")):
+                            score += 1.0
+                    if _saved_location_keyword(saved_inputs.get("location_desc")) == _saved_location_keyword(case_dict.get("location_desc")):
+                        if _saved_location_keyword(case_dict.get("location_desc")):
+                            score += 1.0
+                    if _saved_bool(saved_inputs.get("is_night")) == _saved_bool(case_dict.get("is_night")):
+                        if _saved_bool(case_dict.get("is_night")) is not None:
+                            score += 0.5
+
+                    scored_saved_cases.append(
+                        {
+                            "score": round(float(score), 3),
+                            "saved_time": str(rec.get("created_at_local") or rec.get("created_at") or ""),
+                            "record_id": rec.get("id", ""),
+                            "type": saved_inputs.get("primary_type") or "",
+                            "weapon": saved_inputs.get("weapon_desc") or saved_inputs.get("weapon") or "",
+                            "place": saved_inputs.get("location_desc") or "",
+                            "area": saved_inputs.get("area") or saved_inputs.get("city") or "",
+                            "hour": saved_inputs.get("hour"),
+                            "is_night": saved_inputs.get("is_night"),
+                            "risk_level": final_saved.get("risk_level") or final_saved.get("risk_category") or outputs.get("final_risk_category") or "",
+                            "motive": motive or "",
+                            "_raw": rec,
+                        }
+                    )
+
+                scored_saved_cases.sort(
+                    key=lambda item: (item.get("score", 0), item.get("saved_time", "")),
+                    reverse=True,
+                )
+                saved_sim_cases = scored_saved_cases[:5]
+                if not saved_sim_cases:
+                    saved_message = f"No matching saved cases for Primary type: {cur_type_raw}"
+                    saved_message_level = "warning"
+                else:
+                    saved_message = None
+                    saved_message_level = "info"
         except Exception as err:  # catch-all to avoid crashing UI
             sim_cases = []
             saved_sim_cases = []
             rag_message = f"Error retrieving similar cases: {err}"
             saved_message = f"Error retrieving similar saved cases: {err}"
+            saved_message_level = "warning"
+            saved_debug = {}
 
         st.markdown("### Similar Past Cases (RAG Evidence)")
         st.markdown("#### Top Similar Cases (RAG Index)")
@@ -674,14 +838,11 @@ def main() -> None:
                 if non_empty:
                     saved_cols.append(col)
             st.dataframe(df_saved.reindex(columns=saved_cols))
-
-            for idx, row in enumerate(saved_sim_cases, start=1):
-                score = float(row.get("score", 0.0))
-                record_id = row.get("record_id", f"#{idx}")
-                with st.expander(f"Saved Case {idx}: {record_id} (score: {score:.3f})"):
-                    st.json(make_json_safe(row.get("_raw", row)))
         else:
-            st.info(saved_message or "No similar saved cases found.")
+            if saved_message_level == "warning" and saved_message:
+                st.warning(saved_message)
+            else:
+                st.info(saved_message or "No similar saved cases found.")
 
         # feedback + save/export
         st.markdown("### Feedback")
@@ -752,14 +913,25 @@ def main() -> None:
             if optional_value not in (None, ""):
                 inputs_payload[optional_key] = optional_value
 
+        nested_outputs = fused.get("outputs") if isinstance(fused.get("outputs"), dict) else {}
+        outputs_to_save = {
+            "final": fused.get("final") or nested_outputs.get("final"),
+            "model_version": fused.get("model_version") or (fused.get("meta") or {}).get("model_version") or "",
+            "fusion_meta": fused.get("fusion_meta") or {},
+        }
+        rag_results_to_save = []
+        if isinstance(sim_cases, list):
+            for item in sim_cases[:10]:
+                if isinstance(item, dict):
+                    rag_results_to_save.append(make_json_safe(item))
+
         record_timestamp = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
         record_payload = {
-            "case_id": case_id,
             "created_at_local": record_timestamp,
             "inputs": inputs_payload,
             "narrative_text": narrative or "",
-            "outputs": make_json_safe(fused),
-            "rag_results": make_json_safe(sim_cases) if isinstance(sim_cases, list) else [],
+            "outputs": make_json_safe(outputs_to_save),
+            "rag_results": rag_results_to_save,
             "feedback": {
                 "text": feedback_text or "",
                 "helpful": helpfulness or None,
@@ -770,19 +942,54 @@ def main() -> None:
         save_col, export_col = st.columns(2)
         with save_col:
             if st.button("Save", key="profile_save_button"):
+                firestore_collection = "history"
+                firebase_ready = False
                 try:
-                    from services.firebase_service import (
-                        FirebaseConfigError,
-                        save_case_by_id,
-                    )
+                    import services.audit_service as audit_service
+                    from services.case_id_service import generate_case_id
+                    from services.firebase_service import init_firebase, save_history_record
 
-                    save_case_by_id(case_id, record_payload_safe)
-                    st.success(f"Saved to Firebase (record: {case_id}).")
-                    _log_profile_event("save", case_id, fused)
-                except FirebaseConfigError:
-                    st.error("Firebase not configured. Add service account JSON to Streamlit secrets.")
-                except Exception as err:  # noqa: BLE001
-                    st.error(f"Failed to save record: {err}")
+                    init_firebase()
+                    firebase_ready = True
+                    utc_now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+                    current_user = audit_service.get_current_user()
+                    record_payload = {
+                        "created_at_local": utc_now.isoformat(),
+                        "inputs": inputs_payload,
+                        "narrative_text": narrative or "",
+                        "outputs": outputs_to_save,
+                        "rag_results": rag_results_to_save,
+                        "feedback": {
+                            "text": feedback_text or "",
+                            "helpful": helpfulness or None,
+                        },
+                    }
+                    save_case_id = generate_case_id(record_payload["inputs"].get("city", ""), utc_now)
+                    record_payload["case_id"] = save_case_id
+                    doc_id = save_history_record(record_payload)
+                    st.caption(f"Firestore collection: {firestore_collection} | init_firebase: ok")
+                    st.success(f"Saved: {doc_id}")
+
+                    try:
+                        audit_logged = audit_service.log_event(
+                            action="save",
+                            user=current_user,
+                            case_id=save_case_id,
+                            model_ver=_audit_model_version(fused),
+                            data_ver=_audit_data_version(fused),
+                            page="profile",
+                        )
+                        if not audit_logged:
+                            st.warning("Saved to history, but audit logging failed.")
+                    except Exception as audit_err:  # noqa: BLE001
+                        st.warning(f"Saved to history, but audit logging failed: {type(audit_err).__name__}: {audit_err}")
+                except Exception as e:  # noqa: BLE001
+                    init_status = "ok" if firebase_ready else "failed"
+                    st.caption(f"Firestore collection: {firestore_collection} | init_firebase: {init_status}")
+                    outputs_obj = record_payload.get("outputs") if isinstance(record_payload, dict) else None
+                    outputs_type = type(outputs_obj).__name__
+                    outputs_keys = list(outputs_obj.keys()) if isinstance(outputs_obj, dict) else []
+                    st.error(f"Save failed: {e} | outputs_type={outputs_type} | outputs_keys={outputs_keys}")
 
         with export_col:
             export_name = f"profile_record_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
@@ -811,13 +1018,23 @@ def main() -> None:
 
         # explanation expanders
         with st.expander("Why this prediction?"):
-            tab_feats = fused.get("explanations", {}).get("tabular_top_features", [])
+            expl = fused.get("explanations", {}).get("tabular_text_expl")
+            tab_feats = fused.get("explanations", {}).get("tabular_shap_top", [])
+            st.caption(
+                f"tabular_text_expl present: {bool(expl)} | explanation keys: {list(fused.get('explanations', {}).keys())}"
+            )
+            if expl:
+                st.markdown(str(expl.get("summary") or "").strip())
+                st.markdown("**Key factors increasing the prediction:**")
+                st.markdown("\n".join([f"- {x}" for x in (expl.get("drivers_up") or [])]))
+                st.markdown("**Key factors decreasing the prediction:**")
+                st.markdown("\n".join([f"- {x}" for x in (expl.get("drivers_down") or [])]))
+            else:
+                st.write("No tabular feature explanations available.")
             if tab_feats:
                 df_feats = pd.DataFrame(tab_feats)[:8]
                 df_feats = df_feats.rename(columns={"feature": "Feature", "value": "Value"})
                 st.table(df_feats)
-            else:
-                st.write("No tabular feature explanations available.")
 
         with st.expander("NLP evidence (topâ€‘k)"):
             if topk:

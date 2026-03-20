@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,9 @@ from services.auth_service import render_auth_status
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
 CSS_FILE = ASSETS_DIR / "styles.css"
-ACTION_OPTIONS = ["predict", "save", "export", "login", "logout"]
+EXCLUDED_ACTIONS = {"login", "logout"}
+ACTION_OPTIONS = ["predict", "save", "export"]
+DEFAULT_LOOKBACK_DAYS = 7
 
 
 def inject_styles() -> None:
@@ -40,6 +42,10 @@ def _parse_utc_timestamp(value: Any) -> datetime | None:
     return dt_value.astimezone(timezone.utc)
 
 
+def _event_timestamp(record: dict[str, Any]) -> datetime | None:
+    return _parse_utc_timestamp(record.get("ts_local") or record.get("ts_utc"))
+
+
 def _format_timestamp(value: Any) -> str:
     parsed = _parse_utc_timestamp(value)
     if parsed is None:
@@ -48,20 +54,26 @@ def _format_timestamp(value: Any) -> str:
 
 
 def _prepare_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
+    fallback_data_ver = "N/A"
+    try:
+        from services.audit_service import compute_data_ver
+
+        fallback_data_ver = compute_data_ver() or "N/A"
+    except Exception:
+        fallback_data_ver = "N/A"
+
     prepared = []
     for record in records:
-        ts_utc = record.get("ts_utc") or record.get("ts_local")
+        ts_dt = _event_timestamp(record)
         prepared.append(
             {
-                "Timestamp (UTC)": _format_timestamp(ts_utc),
+                "Timestamp (UTC)": _format_timestamp(ts_dt),
                 "User": str(record.get("user") or "-"),
                 "Action": str(record.get("action") or "-"),
-                "Case ID": str(record.get("case_id") or "-"),
-                "Model ver": str(record.get("model_ver") or "-"),
-                "Data ver": str(record.get("data_ver") or "-"),
+                "Case ID": str(record.get("case_id") or "N/A"),
                 "_page": str(record.get("page") or "-"),
                 "_meta": record.get("meta") or {},
-                "_ts_dt": _parse_utc_timestamp(ts_utc),
+                "_ts_dt": ts_dt,
             }
         )
 
@@ -73,8 +85,6 @@ def _prepare_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
                 "User",
                 "Action",
                 "Case ID",
-                "Model ver",
-                "Data ver",
                 "_page",
                 "_meta",
                 "_ts_dt",
@@ -83,13 +93,127 @@ def _prepare_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
     return df
 
 
-def _reset_filters(default_dates: tuple[date, date]) -> None:
+def _default_date_range() -> tuple[date, date]:
+    today = date.today()
+    return today - timedelta(days=DEFAULT_LOOKBACK_DAYS), today
+
+
+def _reset_filters() -> None:
     st.session_state["audit_user_filter"] = "All users"
     st.session_state["audit_action_filter"] = ACTION_OPTIONS.copy()
-    st.session_state["audit_date_range"] = default_dates
+    st.session_state["audit_date_range"] = _default_date_range()
     st.session_state["audit_case_id_filter"] = ""
+    st.session_state["audit_search_filter"] = ""
     st.session_state["audit_selected_label"] = None
     st.rerun()
+
+
+def _ensure_filter_state(users: list[str]) -> None:
+    if "audit_user_filter" not in st.session_state:
+        st.session_state["audit_user_filter"] = "All users"
+    elif st.session_state["audit_user_filter"] not in users:
+        st.session_state["audit_user_filter"] = "All users"
+
+    if "audit_action_filter" not in st.session_state:
+        st.session_state["audit_action_filter"] = ACTION_OPTIONS.copy()
+    elif not isinstance(st.session_state["audit_action_filter"], list):
+        st.session_state["audit_action_filter"] = ACTION_OPTIONS.copy()
+    else:
+        cleaned_actions = [
+            action for action in st.session_state["audit_action_filter"] if action in ACTION_OPTIONS
+        ]
+        if st.session_state["audit_action_filter"] and not cleaned_actions:
+            st.session_state["audit_action_filter"] = ACTION_OPTIONS.copy()
+        else:
+            st.session_state["audit_action_filter"] = cleaned_actions
+
+    if "audit_date_range" not in st.session_state:
+        st.session_state["audit_date_range"] = _default_date_range()
+    elif not isinstance(st.session_state["audit_date_range"], (list, tuple)) or len(st.session_state["audit_date_range"]) != 2:
+        st.session_state["audit_date_range"] = _default_date_range()
+
+    if "audit_case_id_filter" not in st.session_state:
+        st.session_state["audit_case_id_filter"] = ""
+
+    if "audit_search_filter" not in st.session_state:
+        st.session_state["audit_search_filter"] = ""
+
+    if "audit_selected_label" not in st.session_state:
+        st.session_state["audit_selected_label"] = None
+
+
+def load_audit_events(limit: int = 500) -> list[dict[str, Any]]:
+    try:
+        from firebase_admin import firestore
+
+        from services.firebase_service import FirebaseConfigError, init_firebase
+    except Exception as err:
+        st.info(f"Firebase not configured. {err}")
+        return []
+
+    try:
+        db = init_firebase()
+        docs = (
+            db.collection("audit_events")
+            .order_by("ts_utc", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+        events = [{"id": doc.id, **(doc.to_dict() or {})} for doc in docs]
+        events = [e for e in events if e.get("action") not in EXCLUDED_ACTIONS]
+        return events
+    except FirebaseConfigError as err:
+        st.info(f"Firebase not configured. {err}")
+        return []
+    except Exception as err:
+        st.info(f"Unable to load audit events right now. {err}")
+        return []
+
+
+def _filter_events(
+    records: list[dict[str, Any]],
+    user_filter: str,
+    action_filter: list[str],
+    case_filter: str,
+    date_range: Any,
+    search_filter: str,
+) -> list[dict[str, Any]]:
+    normalized_user = str(user_filter or "").strip()
+    normalized_actions = {str(item).strip().lower() for item in action_filter if str(item).strip()}
+    normalized_case = str(case_filter or "").strip().lower()
+    normalized_search = str(search_filter or "").strip().lower()
+
+    start_date, end_date = _default_date_range()
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start_date, end_date = date_range
+    elif isinstance(date_range, date):
+        start_date = end_date = date_range
+
+    filtered: list[dict[str, Any]] = []
+    for record in records:
+        event_user = str(record.get("user") or "").strip()
+        event_action = str(record.get("action") or "").strip().lower()
+        event_case = str(record.get("case_id") or "").strip()
+        event_ts = _event_timestamp(record)
+        event_date = event_ts.date() if event_ts is not None else None
+
+        if normalized_user and normalized_user != "All users" and event_user != normalized_user:
+            continue
+        if normalized_actions and event_action not in normalized_actions:
+            continue
+        if normalized_case and normalized_case not in event_case.lower():
+            continue
+        if event_date is None or event_date < start_date or event_date > end_date:
+            continue
+        if normalized_search:
+            haystack = " ".join([event_user, event_action, event_case]).lower()
+            if normalized_search not in haystack:
+                continue
+
+        filtered.append(record)
+
+    filtered.sort(key=lambda record: _event_timestamp(record) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return filtered
 
 
 def main() -> None:
@@ -106,41 +230,23 @@ def main() -> None:
     st.caption("Must-have for FR08 - trace user actions and model/data versions.")
 
     try:
-        from services.audit_service import list_distinct_users, query_events
+        import services.audit_service as audit_service
     except Exception as err:
         st.error(f"Audit service unavailable: {err}")
         return
 
-    all_events = query_events(limit=500)
-    all_df = _prepare_dataframe(all_events)
+    current_user_getter = getattr(audit_service, "get_current_user", None)
+    if not callable(current_user_getter):
+        current_user_getter = getattr(audit_service, "get_current_user_label", None)
+    current_user_label = current_user_getter() if callable(current_user_getter) else "unknown"
+    st.caption(f"Current user resolved as: {current_user_label}")
 
-    if not all_df.empty and all_df["_ts_dt"].notna().any():
-        ts_series = all_df["_ts_dt"].dropna()
-        default_date_range = (ts_series.min().date(), ts_series.max().date())
-    else:
-        today = date.today()
-        default_date_range = (today, today)
-
-    users = ["All users"] + list_distinct_users(limit=200)
-
-    if "audit_user_filter" not in st.session_state:
-        st.session_state["audit_user_filter"] = "All users"
-    if "audit_action_filter" not in st.session_state:
-        st.session_state["audit_action_filter"] = ACTION_OPTIONS.copy()
-    if "audit_date_range" not in st.session_state:
-        st.session_state["audit_date_range"] = default_date_range
-    if "audit_case_id_filter" not in st.session_state:
-        st.session_state["audit_case_id_filter"] = ""
-    if "audit_selected_label" not in st.session_state:
-        st.session_state["audit_selected_label"] = None
-
-    if st.session_state["audit_user_filter"] not in users:
-        st.session_state["audit_user_filter"] = "All users"
-    if not isinstance(st.session_state["audit_date_range"], (list, tuple)) or len(st.session_state["audit_date_range"]) != 2:
-        st.session_state["audit_date_range"] = default_date_range
-    st.session_state["audit_action_filter"] = [
-        action for action in st.session_state["audit_action_filter"] if action in ACTION_OPTIONS
-    ]
+    all_events = load_audit_events(limit=500)
+    st.caption(f"First event keys: {list(all_events[0].keys()) if all_events else []}")
+    users = ["All users"] + sorted(
+        {str(item.get("user") or "").strip() for item in all_events if str(item.get("user") or "").strip()}
+    )
+    _ensure_filter_state(users)
 
     filters = st.columns([1.1, 1.1, 1.1, 1, 0.6])
     with filters[0]:
@@ -152,31 +258,33 @@ def main() -> None:
     with filters[3]:
         case_filter = st.text_input("Case ID", placeholder="CASE-2311", key="audit_case_id_filter")
     with filters[4]:
-        st.button("Reset", on_click=_reset_filters, args=(default_date_range,), type="secondary")
+        st.button("Reset", on_click=_reset_filters, type="secondary")
 
-    start_date, end_date = default_date_range
-    if isinstance(date_input, (list, tuple)) and len(date_input) == 2:
-        start_date, end_date = date_input
-    elif isinstance(date_input, date):
-        start_date = end_date = date_input
-
-    filtered_events = query_events(
-        user=None if user_choice == "All users" else user_choice,
-        actions=action_choice or None,
-        case_id=case_filter,
-        start_date=start_date,
-        end_date=end_date,
-        limit=500,
+    filtered_events = _filter_events(
+        records=all_events,
+        user_filter=user_choice,
+        action_filter=action_choice,
+        case_filter=case_filter,
+        date_range=date_input,
+        search_filter=st.session_state.get("audit_search_filter", ""),
     )
     filtered = _prepare_dataframe(filtered_events)
+
+    if not filtered.empty and filtered["_ts_dt"].notna().any():
+        filtered_ts = filtered["_ts_dt"].dropna()
+        min_date = filtered_ts.min().date()
+        max_date = filtered_ts.max().date()
+        date_span = f"{min_date} -> {max_date}"
+    else:
+        date_span = "-"
 
     metrics = st.columns(4)
     metrics[0].metric("Events", len(filtered))
     metrics[1].metric("Unique users", filtered["User"].nunique() if not filtered.empty else 0)
     metrics[2].metric("Actions covered", ", ".join(sorted(filtered["Action"].unique())) if not filtered.empty else "-")
-    metrics[3].metric("Date span", f"{start_date} -> {end_date}")
+    metrics[3].metric("Date span", date_span)
 
-    display_columns = ["Timestamp (UTC)", "User", "Action", "Case ID", "Model ver", "Data ver"]
+    display_columns = ["Timestamp (UTC)", "User", "Action", "Case ID"]
     display_df = filtered[display_columns] if not filtered.empty else pd.DataFrame(columns=display_columns)
 
     st.dataframe(
@@ -187,8 +295,6 @@ def main() -> None:
             "Timestamp (UTC)": st.column_config.TextColumn(width="medium"),
             "Action": st.column_config.TextColumn(width="small"),
             "Case ID": st.column_config.TextColumn(width="small"),
-            "Model ver": st.column_config.TextColumn(width="small"),
-            "Data ver": st.column_config.TextColumn(width="small"),
         },
     )
 
@@ -207,7 +313,6 @@ def main() -> None:
             st.markdown(f"**Timestamp (UTC):** {selected_row['Timestamp (UTC)']}")
             st.markdown(f"**User / Action:** {selected_row['User']} - {selected_row['Action']}")
             st.markdown(f"**Case ID:** {selected_row['Case ID']}")
-            st.markdown(f"**Model ver / Data ver:** {selected_row['Model ver']} / {selected_row['Data ver']}")
             detail_cols = st.columns(3)
             detail_cols[0].markdown("**Status:** success")
             detail_cols[1].markdown(f"**Channel:** {selected_row['_page']}")

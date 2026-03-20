@@ -38,15 +38,17 @@ footer,
 }
 
 .login-head .crime-title {
-  font-size: clamp(40px, 4.4vw, 56px);
+  font-size: 52px !important;
+  font-weight: 800 !important;
+  line-height: 1.05 !important;
   margin-bottom: 0.35rem;
 }
 
 .login-head .crime-sub {
   max-width: 34rem;
   margin: 0 auto;
-  font-size: clamp(13px, 1.35vw, 16px);
-  line-height: 1.45;
+  font-size: 18px !important;
+  line-height: 1.35 !important;
 }
 
 form[data-testid="stForm"][aria-label="login_panel_form"] {
@@ -74,6 +76,7 @@ form[data-testid="stForm"][aria-label="login_panel_form"] div[data-testid="stTex
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.94);
   color: #1f1f1f;
+  font-size: 16px;
   box-shadow: none;
   padding-left: 16px;
   padding-right: 16px;
@@ -81,6 +84,7 @@ form[data-testid="stForm"][aria-label="login_panel_form"] div[data-testid="stTex
 
 form[data-testid="stForm"][aria-label="login_panel_form"] div[data-testid="stTextInput"] input::placeholder {
   color: rgba(0, 0, 0, 0.42);
+  font-size: 16px;
 }
 
 form[data-testid="stForm"][aria-label="login_panel_form"] div[data-testid="stTextInput"] input:focus {
@@ -94,6 +98,7 @@ form[data-testid="stForm"][aria-label="login_panel_form"] div[data-testid="stBut
   border: none !important;
   background: linear-gradient(90deg, #ff1e5a, #e9004f);
   color: #fff;
+  font-size: 16px;
   font-weight: 700;
   letter-spacing: 0.5px;
   box-shadow: 0 14px 28px rgba(0, 0, 0, 0.3);

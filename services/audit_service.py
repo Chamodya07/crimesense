@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
@@ -9,15 +11,23 @@ from services.firebase_service import FirebaseConfigError, init_firebase, make_j
 
 
 _AUDIT_WARNING_KEY = "_audit_service_warning"
+_AUTH_USER_KEY = "auth_user"
 
 
-def get_current_user_label(default: str = "unknown") -> str:
-    payload = st.session_state.get("auth_user")
+def get_current_user(default: str = "unknown") -> str:
+    payload = st.session_state.get(_AUTH_USER_KEY)
     if isinstance(payload, dict):
+        display_name = str(payload.get("display_name", "")).strip()
+        if display_name:
+            return display_name
         username = str(payload.get("username", "")).strip()
         if username:
             return username
     return default
+
+
+def get_current_user_label(default: str = "unknown") -> str:
+    return get_current_user(default=default)
 
 
 def _warn_once(message: str) -> None:
@@ -57,9 +67,62 @@ def _record_in_range(record: dict[str, Any], start_date: date | None, end_date: 
     return True
 
 
+def load_manifest() -> dict[str, Any]:
+    project_root = Path(__file__).resolve().parents[1]
+    manifest_path = project_root / "artifacts" / "manifest.json"
+    try:
+        if not manifest_path.exists():
+            return {}
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        if not path.exists():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def compute_data_ver() -> str:
+    project_root = Path(__file__).resolve().parents[1]
+    artifacts_dir = project_root / "artifacts"
+
+    rag_part = ""
+    rag_meta_path = artifacts_dir / "rag" / "meta.json"
+    if rag_meta_path.exists():
+        rag_meta = _load_json(rag_meta_path)
+        rag_tag = rag_meta.get("tag") or "rag_unknown"
+        rag_part = f"RAG:{rag_tag}"
+
+    tab_part = ""
+    tab_meta_path = artifacts_dir / "tabular" / "meta.json"
+    tab_meta = _load_json(tab_meta_path)
+    tab_tag = tab_meta.get("tag")
+    if tab_tag in (None, ""):
+        for model_meta_path in (
+            artifacts_dir / "tabular" / "portable" / "model_meta.json",
+            artifacts_dir / "tabular" / "crimesense_tabular_only" / "model_meta.json",
+        ):
+            model_meta = _load_json(model_meta_path)
+            tab_tag = model_meta.get("tag") or model_meta.get("notes")
+            if tab_tag not in (None, ""):
+                break
+    if tab_tag not in (None, "") or tab_meta_path.exists():
+        tab_part = f"TAB:{tab_tag or 'tab_unknown'}"
+
+    parts = [part for part in (tab_part, rag_part) if part]
+    return " | ".join(parts) if parts else "N/A"
+
+
 def log_event(
     action: str,
-    user: str,
+    user: str | None = None,
     case_id: str | None = None,
     model_ver: str | None = None,
     data_ver: str | None = None,
@@ -78,15 +141,23 @@ def log_event(
     except Exception:
         return False
 
+    if user is None:
+        user = get_current_user(default="unknown")
+    manifest = load_manifest()
+    model_ver = model_ver or manifest.get("model_ver") or "fusion-mock-v0"
+    if data_ver in (None, "", "N/A"):
+        data_ver = compute_data_ver()
+    data_ver = data_ver or "N/A"
+
     event = make_json_safe(
         {
             "ts_utc": firestore.SERVER_TIMESTAMP,
             "ts_local": datetime.now().astimezone().replace(microsecond=0).isoformat(),
-            "user": str(user or "unknown"),
+            "user": str(user).strip() or "unknown",
             "action": str(action or "").strip().lower(),
             "case_id": str(case_id).strip() if case_id not in (None, "") else None,
-            "model_ver": str(model_ver).strip() if model_ver not in (None, "") else None,
-            "data_ver": str(data_ver).strip() if data_ver not in (None, "") else None,
+            "model_ver": str(model_ver).strip() or "fusion-mock-v0",
+            "data_ver": str(data_ver).strip() or "N/A",
             "page": str(page or "").strip() or None,
             "meta": meta or {},
         }
@@ -123,7 +194,11 @@ def query_events(
         _warn_once(f"Audit log unavailable: {exc}")
         return []
 
-    items = [{"id": doc.id, **make_json_safe(doc.to_dict() or {})} for doc in docs]
+    try:
+        items = [{"id": doc.id, **make_json_safe(doc.to_dict() or {})} for doc in docs]
+    except Exception as exc:
+        _warn_once(f"Audit log unavailable: {exc}")
+        return []
 
     normalized_user = str(user or "").strip()
     normalized_actions = {str(action).strip().lower() for action in (actions or []) if str(action).strip()}
@@ -157,7 +232,10 @@ def list_distinct_users(limit: int = 200) -> list[str]:
 
 
 __all__ = [
+    "compute_data_ver",
+    "get_current_user",
     "get_current_user_label",
+    "load_manifest",
     "log_event",
     "query_events",
     "list_distinct_users",
