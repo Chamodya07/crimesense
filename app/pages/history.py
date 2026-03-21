@@ -324,7 +324,29 @@ def build_case_pdf(case: dict) -> bytes:
 
 
 def render_case_details(case: dict, show_title: bool = True) -> None:
+    def _display_value(value):
+        if value is None:
+            return "\u2014"
+        text = str(value).strip()
+        if text in {"", "-", "--", "None", "nan"}:
+            return "\u2014"
+        return text
+
     c = {k: v for k, v in case.items() if k != "_raw"}
+    raw_record = case.get("_raw") if isinstance(case.get("_raw"), dict) else {}
+    raw_inputs = raw_record.get("inputs") if isinstance(raw_record.get("inputs"), dict) else {}
+    victim = raw_inputs.get("victim")
+    if not isinstance(victim, dict):
+        victim = raw_record.get("victim")
+    if not isinstance(victim, dict):
+        victim = {}
+
+    victim_age = _display_value(victim.get("age") or raw_inputs.get("victim_age") or c.get("age"))
+    victim_gender = _display_value(
+        victim.get("gender") or raw_inputs.get("victim_gender") or raw_inputs.get("victim_sex") or c.get("gender")
+    )
+    victim_race = _display_value(victim.get("race") or raw_inputs.get("victim_race"))
+
     if show_title:
         st.subheader(c["title"])
         st.caption(f"Case ID: {c.get('id', '-')}")
@@ -335,14 +357,23 @@ def render_case_details(case: dict, show_title: bool = True) -> None:
 
     st.markdown("### Victim / profile info")
     info_cols = st.columns(3)
-    info_cols[0].markdown(f"**Victim:** {c['victim']}")
-    info_cols[1].markdown(f"**Age:** {c.get('age','--') if c.get('age') is not None else '--'}")
-    info_cols[2].markdown(f"**Gender:** {c.get('gender','--')}")
+    info_cols[0].markdown(f"**Victim Age:** {victim_age}")
+    info_cols[1].markdown(f"**Gender:** {victim_gender}")
+    info_cols[2].markdown(f"**Race:** {victim_race}")
 
     _render_compact_section(
         "Inputs",
         c.get("inputs_full"),
-        exclude_keys={"narrative_text", "description", "victim_name", "victim_age", "victim_gender", "victim_sex"},
+        exclude_keys={
+            "narrative_text",
+            "description",
+            "victim",
+            "victim_name",
+            "victim_age",
+            "victim_gender",
+            "victim_sex",
+            "victim_race",
+        },
     )
 
     st.markdown("### Description")

@@ -92,8 +92,12 @@ def _jsonish(value: Any) -> Any:
     return value
 
 
+def _query_primary_type(case_dict: Dict[str, Any]) -> str:
+    return _field_text(case_dict.get("primary_type") or case_dict.get("type"))
+
+
 def _query_text_from_profile(case_dict: Dict[str, Any]) -> str:
-    primary_type = _field_text(case_dict.get("primary_type"))
+    primary_type = _query_primary_type(case_dict)
     weapon_desc = _field_text(case_dict.get("weapon_desc"))
     location_desc = _field_text(case_dict.get("location_desc"))
     parts: List[str] = []
@@ -114,7 +118,7 @@ def _query_text_from_profile(case_dict: Dict[str, Any]) -> str:
 
     if not parts:
         return "TYPE: UNKNOWN"
-    return " | ".join(parts)
+    return "\n".join(parts)
 
 
 def build_query_text(case_dict: Dict[str, Any]) -> str:
@@ -145,8 +149,11 @@ def retrieve_similar_cases(
     query_emb = np.asarray(query_emb, dtype="float32")
     faiss.normalize_L2(query_emb)
 
-    scores, idxs = index.search(query_emb, int(top_k))
-    rows: List[Dict[str, Any]] = []
+    q_type = (case_dict.get("primary_type") or case_dict.get("type") or "").strip().upper()
+    q_place = (case_dict.get("location_desc") or case_dict.get("place") or "").strip().upper()
+    top_n = min(max(int(top_k) * 50, 200), len(cases_df))
+    scores, idxs = index.search(query_emb, top_n)
+    candidates: List[Dict[str, Any]] = []
     for score, idx in zip(scores[0].tolist(), idxs[0].tolist()):
         if idx < 0 or idx >= len(cases_df):
             continue
@@ -172,8 +179,30 @@ def retrieve_similar_cases(
 
         if "case_id" not in item:
             item["case_id"] = _jsonish(row.get("case_id", "")) or str(int(idx))
-        rows.append(item)
-    return rows, None
+        candidates.append(item)
+
+    if q_type:
+        type_matches = [r for r in candidates if str(r.get("type", "")).strip().upper() == q_type]
+        type_place_matches: List[Dict[str, Any]] = []
+        if q_place:
+            type_place_matches = [
+                r for r in type_matches if q_place in str(r.get("place", "")).strip().upper()
+            ]
+
+        print(
+            f"RAG q_type={q_type} q_place={q_place} "
+            f"candidates={len(candidates)} type_matches={len(type_matches)} place_matches={len(type_place_matches)}"
+        )
+
+        if q_place and type_place_matches:
+            return type_place_matches[: int(top_k)], None
+
+        if type_matches:
+            return type_matches[: int(top_k)], None
+
+        return [], None
+
+    return candidates[: int(top_k)], None
 
 
 def clear_index_cache() -> None:

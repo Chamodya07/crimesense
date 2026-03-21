@@ -224,6 +224,211 @@ def _python_scalar(value: Any) -> Any:
     return value
 
 
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(_python_scalar(value))
+    except Exception:
+        return None
+
+
+def _confidence_band(confidence: float | None) -> str | None:
+    if confidence is None:
+        return None
+    if confidence >= 0.75:
+        return "High"
+    if confidence >= 0.55:
+        return "Medium"
+    return "Low"
+
+
+def _sigmoid(value: float) -> float:
+    try:
+        import math
+
+        if value >= 0:
+            z = math.exp(-value)
+            return 1.0 / (1.0 + z)
+        z = math.exp(value)
+        return z / (1.0 + z)
+    except Exception:
+        return 0.5
+
+
+def _softmax(values: List[float]) -> List[float]:
+    try:
+        import math
+
+        if not values:
+            return []
+        max_value = max(values)
+        exps = [math.exp(value - max_value) for value in values]
+        total = sum(exps)
+        if total <= 0:
+            return []
+        return [exp_value / total for exp_value in exps]
+    except Exception:
+        return []
+
+
+def _decode_probability_labels(model: Any, label_encoder: Any, count: int) -> List[str]:
+    raw_classes = getattr(model, "classes_", None)
+    if raw_classes is None or len(raw_classes) != count:
+        raw_classes = list(range(count))
+
+    decoded: List[str] = []
+    for class_value in raw_classes:
+        label = _python_scalar(class_value)
+        if label_encoder is not None:
+            try:
+                label = label_encoder.inverse_transform([class_value])[0]
+            except Exception:
+                try:
+                    label = label_encoder.inverse_transform([int(class_value)])[0]
+                except Exception:
+                    label = _python_scalar(class_value)
+        decoded.append(str(_python_scalar(label)))
+    return decoded
+
+
+def _summarize_probabilities(
+    probabilities: Any,
+    *,
+    model: Any = None,
+    label_encoder: Any = None,
+) -> Tuple[Dict[str, float], float | None, str | None]:
+    try:
+        import numpy as np  # type: ignore
+
+        prob_array = np.asarray(probabilities)
+        if prob_array.ndim == 2:
+            prob_array = prob_array[0]
+        prob_values = [_safe_float(item) for item in prob_array.tolist()]
+    except Exception:
+        if isinstance(probabilities, (list, tuple)):
+            prob_values = [_safe_float(item) for item in probabilities]
+        else:
+            return {}, None, None
+
+    normalized = [value for value in prob_values if value is not None]
+    if not normalized:
+        return {}, None, None
+
+    labels = _decode_probability_labels(model, label_encoder, len(normalized))
+    prob_map = {
+        labels[idx]: round(float(value), 4)
+        for idx, value in enumerate(normalized)
+        if idx < len(labels)
+    }
+    top_prob = max(normalized)
+    return prob_map, top_prob, _confidence_band(top_prob)
+
+
+def _normalize_per_target_outputs(raw_output: Any, targets: List[str]) -> List[Any]:
+    try:
+        import numpy as np  # type: ignore
+
+        if isinstance(raw_output, list):
+            return list(raw_output)
+
+        array = np.asarray(raw_output)
+        if array.ndim == 1:
+            return [array]
+        if array.ndim == 2:
+            if len(targets) == 1:
+                return [array]
+            if array.shape[0] == len(targets):
+                return [array[idx] for idx in range(array.shape[0])]
+            if array.shape[1] == len(targets) and array.shape[0] == 1:
+                return [array[:, idx] for idx in range(array.shape[1])]
+            return [array]
+        if array.ndim == 3:
+            return [array[idx] for idx in range(min(array.shape[0], len(targets)))]
+    except Exception:
+        if isinstance(raw_output, list):
+            return list(raw_output)
+    return []
+
+
+def _decision_scores_to_probabilities(scores: Any) -> Any:
+    try:
+        import numpy as np  # type: ignore
+
+        score_array = np.asarray(scores)
+    except Exception:
+        return None
+
+    if score_array.ndim == 0:
+        probability = _sigmoid(float(score_array))
+        return [[1.0 - probability, probability]]
+    if score_array.ndim == 1:
+        values = [float(item) for item in score_array.tolist()]
+        if len(values) == 1:
+            probability = _sigmoid(values[0])
+            return [[1.0 - probability, probability]]
+        return [_softmax(values)]
+    if score_array.ndim == 2:
+        if score_array.shape[1] == 1:
+            probability = _sigmoid(float(score_array[0, 0]))
+            return [[1.0 - probability, probability]]
+        return [_softmax([float(item) for item in score_array[0].tolist()])]
+    return None
+
+
+def compute_confidence(
+    model: Any,
+    X: Any,
+    targets: List[str],
+    label_encoders: Dict[str, Any] | None = None,
+) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, Dict[str, float]]]:
+    encoders = label_encoders or {}
+    confidence: Dict[str, float] = {}
+    band: Dict[str, str] = {}
+    class_probs: Dict[str, Dict[str, float]] = {}
+    per_target_models = getattr(model, "estimators_", None) or []
+
+    probability_outputs: List[Any] = []
+    if hasattr(model, "predict_proba"):
+        try:
+            probability_outputs = _normalize_per_target_outputs(model.predict_proba(X), targets)
+        except Exception:
+            probability_outputs = []
+
+    use_decision = not probability_outputs and hasattr(model, "decision_function")
+    decision_outputs: List[Any] = []
+    if use_decision:
+        try:
+            decision_outputs = _normalize_per_target_outputs(model.decision_function(X), targets)
+        except Exception:
+            decision_outputs = []
+
+    raw_outputs = probability_outputs or decision_outputs
+    if not raw_outputs:
+        return {}, {}, {}
+
+    for idx, target_name in enumerate(targets):
+        if idx >= len(raw_outputs):
+            continue
+        estimator = per_target_models[idx] if idx < len(per_target_models) else model
+        raw_values = raw_outputs[idx]
+        if use_decision:
+            raw_values = _decision_scores_to_probabilities(raw_values)
+        prob_map, top_prob, top_band = _summarize_probabilities(
+            raw_values,
+            model=estimator,
+            label_encoder=encoders.get(target_name),
+        )
+        if prob_map:
+            class_probs[target_name] = prob_map
+        if top_prob is not None:
+            confidence[target_name] = round(float(top_prob), 4)
+        if top_band:
+            band[target_name] = top_band
+
+    return confidence, band, class_probs
+
+
 def _build_tabular_shap_top(
     models: Dict[str, Any],
     targets: List[str],
@@ -373,6 +578,9 @@ def predict_tabular(case_dict: Dict[str, Any]) -> Dict[str, Any]:
             models = info.get("models", {})
             encoders = info.get("label_encoders", {})
             X = df.values
+            confidence: Dict[str, float] = {}
+            band: Dict[str, str] = {}
+            class_probs: Dict[str, Dict[str, float]] = {}
             for tgt in targets:
                 clf = models.get(tgt)
                 if clf is None:
@@ -389,6 +597,16 @@ def predict_tabular(case_dict: Dict[str, Any]) -> Dict[str, Any]:
                     label = str(num)
                 pred_dict[tgt] = label
 
+                target_conf, target_band, target_probs = compute_confidence(
+                    clf,
+                    X,
+                    [tgt],
+                    label_encoders={tgt: le} if le is not None else {},
+                )
+                confidence.update(target_conf)
+                band.update(target_band)
+                class_probs.update(target_probs)
+
             shap_top = _build_tabular_shap_top(models, targets, df)
             target_name = "risk_level" if "risk_level" in targets else (targets[0] if targets else None)
             tabular_text_expl = shap_to_natural_language(shap_top, target_name=target_name)
@@ -400,6 +618,9 @@ def predict_tabular(case_dict: Dict[str, Any]) -> Dict[str, Any]:
                 "raw_features": case_dict,
                 "input_summary": row_summary,
                 "shap_top": [(item["feature"], item["value"]) for item in shap_top],
+                "class_probs": class_probs,
+                "confidence": confidence,
+                "band": band,
                 "explanations": {
                     "tabular_shap_top": shap_top,
                     "tabular_text_expl": tabular_text_expl,
@@ -441,12 +662,22 @@ def predict_tabular(case_dict: Dict[str, Any]) -> Dict[str, Any]:
         for tgt in targets:
             pred_dict.setdefault(tgt, "Unknown")
 
+        confidence, band, class_probs = compute_confidence(
+            model,
+            X,
+            targets,
+            label_encoders=info.get("label_encoders"),
+        )
+
         output = {
             "pred": pred_dict,
             "meta": {"targets": targets, "features": features, "source": "tabular"},
             "model_version": version,
             "raw_features": case_dict,
             "input_summary": row_summary,
+            "class_probs": class_probs,
+            "confidence": confidence,
+            "band": band,
             "explanations": {
                 "tabular_shap_top": [],
                 "tabular_text_expl": shap_to_natural_language([], target_name="risk_level"),
@@ -463,6 +694,7 @@ def predict_tabular(case_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 __all__ = [
     "ModelNotAvailableError",
+    "compute_confidence",
     "load_tabular_model",
     "prepare_tabular_row",
     "predict_tabular",

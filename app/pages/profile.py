@@ -18,6 +18,8 @@ from services.auth_service import render_auth_status
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
 CSS_FILE = ASSETS_DIR / "styles.css"
+EM_DASH = "\u2014"
+PROFILE_TRAITS = ("risk_level", "crime_severity", "offender_experience")
 
 
 def make_json_safe(obj):
@@ -166,6 +168,106 @@ def _audit_data_version(fused: dict | None) -> str | None:
     return None
 
 
+def _safe_float(value):
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _band_from_confidence(confidence: float | None) -> str | None:
+    if confidence is None:
+        return None
+    if confidence >= 0.75:
+        return "High"
+    if confidence >= 0.55:
+        return "Medium"
+    return "Low"
+
+
+def _max_probability(probabilities):
+    if isinstance(probabilities, dict):
+        values = [_safe_float(value) for value in probabilities.values()]
+    elif isinstance(probabilities, (list, tuple)):
+        values = [_safe_float(value) for value in probabilities]
+    else:
+        return None
+
+    normalized = [value for value in values if value is not None]
+    return max(normalized) if normalized else None
+
+
+def _trait_probability_from_source(source: dict | None, trait: str):
+    if not isinstance(source, dict):
+        return None
+
+    candidate = source.get(trait)
+    if isinstance(candidate, dict):
+        return _max_probability(candidate)
+    return None
+
+
+def _extract_trait_confidence(source: dict | None, trait: str):
+    if not isinstance(source, dict):
+        return None, None
+
+    direct = source.get(trait)
+    if isinstance(direct, dict):
+        conf = _safe_float(direct.get("conf") or direct.get("confidence"))
+        band = str(direct.get("band") or "").strip() or None
+        if conf is not None or band:
+            return conf, band
+
+    confidence_maps = [source.get("confidence"), source.get("confidences")]
+    band_maps = [source.get("band"), source.get("bands")]
+    for conf_map in confidence_maps:
+        if isinstance(conf_map, dict) and trait in conf_map:
+            conf = _safe_float(conf_map.get(trait))
+            band = None
+            for band_map in band_maps:
+                if isinstance(band_map, dict) and trait in band_map:
+                    band = str(band_map.get(trait) or "").strip() or None
+                    break
+            return conf, band
+
+    for probs_key in ("tabular_probs", "proba", "pred_proba", "class_probs"):
+        top_prob = _trait_probability_from_source(source.get(probs_key), trait)
+        if top_prob is not None:
+            return top_prob, _band_from_confidence(top_prob)
+
+    return None, None
+
+
+def _format_trait_confidence_display(fused: dict, trait: str) -> str:
+    sources = []
+
+    final = fused.get("final")
+    if isinstance(final, dict):
+        sources.append(final)
+
+    explanations = fused.get("explanations")
+    if isinstance(explanations, dict):
+        sources.append(explanations)
+
+    tabular_out = fused.get("_tabular_output")
+    if isinstance(tabular_out, dict):
+        sources.append(tabular_out)
+        tabular_explanations = tabular_out.get("explanations")
+        if isinstance(tabular_explanations, dict):
+            sources.append(tabular_explanations)
+
+    for source in sources:
+        conf, band = _extract_trait_confidence(source, trait)
+        if conf is None:
+            continue
+        band_text = band or _band_from_confidence(conf)
+        return f"{conf:.2f} ({band_text})" if band_text else f"{conf:.2f}"
+
+    return EM_DASH
+
+
 def _log_profile_event(action: str, case_id: str | None, fused: dict | None, meta: dict | None = None) -> None:
     try:
         from services.audit_service import log_event
@@ -193,7 +295,7 @@ def main() -> None:
     render_auth_status("profile")
 
     st.title("Case Profiling")
-    st.markdown("Provide structured details about the incident below. You may also paste a full case JSON if you prefer.")
+    st.markdown("Provide structured details about the incident below.")
 
     # load tabular feature list for later mapping
     # if the model artefacts are missing we want to inform the user
@@ -219,87 +321,90 @@ def main() -> None:
     # it should normally remain empty.
     UI_TO_MODEL: dict = {}
 
-
-    # --- Input tabs -------------------------------------------------------
-    tab1, tab2 = st.tabs(["Form Input", "Paste JSON"])
-
     # form data collection
     form_data: dict = {}
-    with tab1:
-        # Incident Details
-        with st.expander("Incident Details", expanded=True):
-            form_data["city"] = st.text_input("City", value="Chicago")
-            # primary_type selectbox with ability to specify custom
-            crime_options = ["", "Theft", "Assault", "Robbery", "Burglary", "Homicide", "Other"]
-            primary_choice = st.selectbox("Primary type", options=crime_options)
-            if primary_choice == "Other":
-                form_data["primary_type"] = st.text_input("Specify crime type")
-            else:
-                form_data["primary_type"] = primary_choice
-            # location description
-            loc_options = ["", "Street", "Residence", "Business", "Park", "Other"]
-            loc_choice = st.selectbox("Location description", options=loc_options)
-            if loc_choice == "Other":
-                form_data["location_desc"] = st.text_input("Specify location description")
-            else:
-                form_data["location_desc"] = loc_choice
-            form_data["weapon_desc"] = st.selectbox(
-                "Weapon description",
-                options=["", "None", "Knife", "Gun", "Blunt", "Unknown", "Other"],
+    # Incident Details
+    with st.expander("Incident Details", expanded=True):
+        form_data["city"] = st.text_input("City", value="Chicago")
+        # primary_type selectbox with ability to specify custom
+        crime_options = ["", "Theft", "Assault", "Robbery", "Burglary", "Homicide", "Other"]
+        primary_choice = st.selectbox("Primary type", options=crime_options)
+        if primary_choice == "Other":
+            form_data["primary_type"] = st.text_input("Specify crime type")
+        else:
+            form_data["primary_type"] = primary_choice
+        # location description
+        loc_options = ["", "Street", "Residence", "Business", "Park", "Other"]
+        loc_choice = st.selectbox("Location description", options=loc_options)
+        if loc_choice == "Other":
+            form_data["location_desc"] = st.text_input("Specify location description")
+        else:
+            form_data["location_desc"] = loc_choice
+        form_data["weapon_desc"] = st.selectbox(
+            "Weapon description",
+            options=["", "None", "Knife", "Gun", "Blunt", "Unknown", "Other"],
+        )
+        form_data["arrest"] = st.checkbox("Arrest made", value=False)
+        form_data["domestic"] = st.checkbox("Domestic incident", value=False)
+    # Time & Date
+    with st.expander("Time & Date", expanded=True):
+        date_col, hour_col, minute_col = st.columns([2, 1, 1])
+        with date_col:
+            form_data["incident_date"] = st.date_input("Date", value=dt.date.today())
+        with hour_col:
+            form_data["incident_hour"] = st.selectbox(
+                "Hour",
+                options=list(range(24)),
+                format_func=lambda value: f"{value:02d}",
             )
-            form_data["arrest"] = st.checkbox("Arrest made", value=False)
-            form_data["domestic"] = st.checkbox("Domestic incident", value=False)
-        # Time & Date
-        with st.expander("Time & Date", expanded=True):
-            date_col, hour_col, minute_col = st.columns([2, 1, 1])
-            with date_col:
-                form_data["incident_date"] = st.date_input("Date", value=dt.date.today())
-            with hour_col:
-                form_data["incident_hour"] = st.selectbox(
-                    "Hour",
-                    options=list(range(24)),
-                    format_func=lambda value: f"{value:02d}",
-                )
-            with minute_col:
-                form_data["incident_minute"] = st.selectbox(
-                    "Minute",
-                    options=list(range(60)),
-                    format_func=lambda value: f"{value:02d}",
-                )
-
-            form_data["incident_time"] = dt.time(
-                hour=form_data["incident_hour"],
-                minute=form_data["incident_minute"],
+        with minute_col:
+            form_data["incident_minute"] = st.selectbox(
+                "Minute",
+                options=list(range(60)),
+                format_func=lambda value: f"{value:02d}",
             )
-            form_data["hour"] = form_data["incident_hour"]
-            form_data["is_night"] = form_data["hour"] >= 18 or form_data["hour"] <= 5
-        # Location coordinates
-        with st.expander("Location", expanded=False):
-            form_data["latitude"] = st.number_input("Latitude", value=0.0, format="%f")
-            form_data["longitude"] = st.number_input("Longitude", value=0.0, format="%f")
-        # keep extraneous expanders for layout consistency
-        with st.expander("Victim / Context (optional)", expanded=False):
-            st.write("Not required for current model.")
-        with st.expander("Offender Indicators (optional)", expanded=False):
-            st.write("These values are predicted and will appear after you click **Predict**.")
 
-    # JSON paste tab
-    case_json = ""
-    json_valid = False
-    parsed_json: dict = {}
-    json_error: str | None = None
-    with tab2:
-        case_json = st.text_area("Paste case JSON", value="", height=200)
-        if case_json.strip():
-            try:
-                parsed_json = json.loads(case_json)
-                if not isinstance(parsed_json, dict):
-                    raise ValueError("JSON must be an object with key/value pairs")
-                json_valid = True
-                st.success(f"Parsed JSON with {len(parsed_json.keys())} top-level keys.")
-            except Exception as e:  # noqa: BLE001
-                json_error = str(e)
-                st.error(f"Invalid JSON: {json_error}")
+        form_data["incident_time"] = dt.time(
+            hour=form_data["incident_hour"],
+            minute=form_data["incident_minute"],
+        )
+        form_data["hour"] = form_data["incident_hour"]
+        form_data["is_night"] = form_data["hour"] >= 18 or form_data["hour"] <= 5
+    # Location coordinates
+    with st.expander("Location", expanded=False):
+        form_data["latitude"] = st.number_input("Latitude", value=0.0, format="%f")
+        form_data["longitude"] = st.number_input("Longitude", value=0.0, format="%f")
+    # keep extraneous expanders for layout consistency
+    with st.expander("Victim / Context (optional)", expanded=False):
+        st.write("Not required for current model.")
+        victim_age = st.number_input(
+            "Victim age",
+            min_value=0,
+            max_value=120,
+            value=0,
+            step=1,
+        )
+        victim_gender = st.selectbox(
+            "Victim gender",
+            options=["", "Male", "Female", "Other", "Unknown"],
+        )
+        victim_race = st.selectbox(
+            "Victim race",
+            options=[
+                "",
+                "Unknown",
+                "White",
+                "Black / African American",
+                "Hispanic / Latino",
+                "Asian",
+                "American Indian / Alaska Native",
+                "Native Hawaiian / Pacific Islander",
+                "Middle Eastern / North African",
+                "Other",
+            ],
+        )
+    with st.expander("Offender Indicators (optional)", expanded=False):
+        st.write("These values are predicted and will appear after you click **Predict**.")
 
     # narrative field below tabs
     narrative = st.text_area("Narrative / Description (optional)", height=160)
@@ -380,12 +485,6 @@ def main() -> None:
             _clear_prediction_state()
             st.error("Cannot predict: tabular model failed to load. Check errors above.")
             return
-        # validation
-        if predict_clicked and case_json.strip() and not json_valid:
-            _clear_prediction_state()
-            st.error("Cannot predict: JSON is invalid.")
-            return
-
         # build interim dict from form entries. apply any UIâ†’model translation
         # mapping so that the final payload uses the exact keys expected by
         # the tabular model. the translation dict is normally empty but kept
@@ -401,15 +500,23 @@ def main() -> None:
                 model_key = UI_TO_MODEL.get(k, k)
                 raw[model_key] = v
 
-            # merge JSON override (JSON wins when keys collide)
-            if json_valid and parsed_json:
-                raw.update(parsed_json)
+            def _clean_optional_text(value):
+                if value in (None, ""):
+                    return None
+                text = str(value).strip()
+                return text or None
 
             # construct case_dict with every feature name from the model
             case_dict: dict = {feat: raw.get(feat, 0) for feat in _features}
             for k, v in raw.items():
                 if k not in case_dict:
                     case_dict[k] = v
+            victim_age_to_save = None if victim_age == 0 else int(victim_age)
+            case_dict["victim"] = {
+                "age": victim_age_to_save,
+                "gender": _clean_optional_text(victim_gender),
+                "race": _clean_optional_text(victim_race),
+            }
 
             if not _valid_required_fields(case_dict):
                 _clear_prediction_state()
@@ -491,8 +598,8 @@ def main() -> None:
         # summary metrics â€“ only display the true model outputs now.
         from components.explanations import render_ethical_notice
         risk = clean_str(final.get("risk_level") or final.get("risk_category", "Unknown"))
-        severity = clean_str(final.get("crime_severity", "â€”"))
-        experience = clean_str(final.get("offender_experience", "â€”"))
+        severity = clean_str(final.get("crime_severity", EM_DASH))
+        experience = clean_str(final.get("offender_experience", EM_DASH))
         mot_info = final.get("motive") if isinstance(final.get("motive"), dict) else {}
         motive_pred = clean_str(mot_info.get("pred", "")) if mot_info else ""
         motive_conf = mot_info.get("conf") or mot_info.get("confidence")
@@ -518,16 +625,22 @@ def main() -> None:
         import pandas as pd
 
         traits = []
-        allowed = {"risk_level", "crime_severity", "offender_experience"}
-        for k, v in final.items():
-            if k not in allowed:
-                continue
-            if isinstance(v, dict):
-                pred = clean_str(v.get("pred", ""))
-                band = v.get("band") or v.get("conf") or v.get("confidence", "")
-                traits.append({"Trait": k, "Prediction": pred, "Confidence/Band": band})
+        tabular_pred = fused.get("_tabular_output", {}).get("pred", {})
+        for trait_name in PROFILE_TRAITS:
+            raw_value = final.get(trait_name)
+            if raw_value is None and isinstance(tabular_pred, dict):
+                raw_value = tabular_pred.get(trait_name)
+            if isinstance(raw_value, dict):
+                prediction = clean_str(raw_value.get("pred", ""))
             else:
-                traits.append({"Trait": k, "Prediction": clean_str(v), "Confidence/Band": ""})
+                prediction = clean_str(raw_value)
+            traits.append(
+                {
+                    "Trait": trait_name,
+                    "Prediction": prediction or EM_DASH,
+                    "Confidence/Band": _format_trait_confidence_display(fused, trait_name),
+                }
+            )
         if traits:
             st.markdown("### Profiling traits")
             st.table(pd.DataFrame(traits))
@@ -715,6 +828,11 @@ def main() -> None:
                     final_saved = outputs.get("final", {}) if isinstance(outputs, dict) else {}
                     motive_obj = final_saved.get("motive", {})
                     motive = motive_obj.get("pred") if isinstance(motive_obj, dict) else motive_obj
+                    victim = saved_inputs.get("victim", {})
+                    if not isinstance(victim, dict):
+                        victim = rec.get("victim", {})
+                    if not isinstance(victim, dict):
+                        victim = {}
 
                     score = 1.0
                     if _normalize_saved_value(saved_inputs.get("weapon_desc")) == _normalize_saved_value(case_dict.get("weapon_desc")):
@@ -740,6 +858,9 @@ def main() -> None:
                             "is_night": saved_inputs.get("is_night"),
                             "risk_level": final_saved.get("risk_level") or final_saved.get("risk_category") or outputs.get("final_risk_category") or "",
                             "motive": motive or "",
+                            "victim_age": victim.get("age") if victim.get("age") not in (None, "") else EM_DASH,
+                            "victim_gender": victim.get("gender") if victim.get("gender") not in (None, "") else EM_DASH,
+                            "victim_race": victim.get("race") if victim.get("race") not in (None, "") else EM_DASH,
                             "_raw": rec,
                         }
                     )
@@ -808,9 +929,6 @@ def main() -> None:
                 "area",
                 "hour",
                 "is_night",
-                "victim_age",
-                "victim_sex",
-                "victim_race",
                 "suspect_age",
                 "suspect_sex",
                 "suspect_race",
@@ -824,6 +942,9 @@ def main() -> None:
                 "motive_band",
                 "helpfulness",
                 "feedback_text",
+                "victim_age",
+                "victim_gender",
+                "victim_race",
             ]
             saved_cols = []
             for col in preferred_saved_cols:
@@ -888,6 +1009,12 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 return None
 
+        def _to_text_or_none(value):
+            if value in (None, ""):
+                return None
+            text = str(value).strip()
+            return text or None
+
         inputs_payload = make_json_safe(dict(case_dict))
         inputs_payload["primary_type"] = (
             _pick_value(inputs_payload, "primary_type", "crime_type", "type") or "Unknown"
@@ -903,6 +1030,15 @@ def main() -> None:
         inputs_payload["latitude"] = _to_float_or_none(inputs_payload.get("latitude"))
         inputs_payload["longitude"] = _to_float_or_none(inputs_payload.get("longitude"))
         inputs_payload["narrative_text"] = narrative or inputs_payload.get("narrative_text") or ""
+        victim_payload = inputs_payload.get("victim") if isinstance(inputs_payload.get("victim"), dict) else {}
+        victim_age_value = _to_int_or_none(victim_payload.get("age"))
+        if victim_age_value is None:
+            victim_age_value = _to_text_or_none(victim_payload.get("age"))
+        inputs_payload["victim"] = {
+            "age": victim_age_value,
+            "gender": _to_text_or_none(victim_payload.get("gender")),
+            "race": _to_text_or_none(victim_payload.get("race")),
+        }
 
         for optional_key, source_keys in (
             ("victim_name", ("victim_name", "victim")),
@@ -912,6 +1048,12 @@ def main() -> None:
             optional_value = _pick_value(inputs_payload, *source_keys)
             if optional_value not in (None, ""):
                 inputs_payload[optional_key] = optional_value
+        if inputs_payload["victim"].get("age") not in (None, ""):
+            inputs_payload["victim_age"] = inputs_payload["victim"].get("age")
+        if inputs_payload["victim"].get("gender") not in (None, ""):
+            inputs_payload["victim_gender"] = inputs_payload["victim"].get("gender")
+        if inputs_payload["victim"].get("race") not in (None, ""):
+            inputs_payload["victim_race"] = inputs_payload["victim"].get("race")
 
         nested_outputs = fused.get("outputs") if isinstance(fused.get("outputs"), dict) else {}
         outputs_to_save = {
