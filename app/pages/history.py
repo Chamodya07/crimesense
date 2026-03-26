@@ -13,8 +13,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from services.auth_service import render_auth_status
-from services.firebase_service import list_history_records
-from services.history_service import load_history_cases
+from services.firebase_service import get_case_by_id, list_history_records
+from services.history_service import firebase_record_to_ui_case, load_history_cases
 
 try:
     from docx import Document
@@ -154,32 +154,110 @@ def _render_compact_section(title: str, data: object, *, exclude_keys: set[str] 
 
 def _render_rag_evidence(case: dict) -> None:
     st.markdown("### RAG evidence")
-    rag_items = case.get("similar_cases_full") or []
-    if not isinstance(rag_items, list) or not rag_items:
+    rag_payload = case.get("rag_full") or {}
+    if not isinstance(rag_payload, dict):
+        rag_payload = {}
+
+    rag_summary = rag_payload.get("summary") or {}
+    rag_items = rag_payload.get("top_cases") or case.get("similar_cases_full") or []
+    similar_saved_cases = rag_payload.get("similar_saved_cases") or []
+
+    has_summary = isinstance(rag_summary, dict) and any(value not in (None, "", [], {}) for value in rag_summary.values())
+    has_rag_items = isinstance(rag_items, list) and bool(rag_items)
+    has_saved_items = isinstance(similar_saved_cases, list) and bool(similar_saved_cases)
+
+    if not has_summary and not has_rag_items and not has_saved_items:
         st.write("No RAG evidence saved.")
         return
+
+    if has_summary:
+        st.markdown("**RAG Summary**")
+        summary_lines = []
+        for key in (
+            "evidence_strength",
+            "most_common_type",
+            "most_common_place",
+            "most_common_area",
+            "law_category_distribution",
+            "attempt_status_distribution",
+            "most_common_weapon",
+            "most_common_victim_age",
+            "most_common_victim_sex",
+            "most_common_victim_race",
+            "most_common_suspect_age",
+            "most_common_suspect_sex",
+            "most_common_suspect_race",
+        ):
+            value = rag_summary.get(key)
+            formatted = _format_display_value(value)
+            if formatted == "-":
+                continue
+            summary_lines.append(f"- {_humanize_key(key)}: {formatted}")
+        if summary_lines:
+            st.markdown("\n".join(summary_lines))
 
     try:
         import pandas as pd
 
-        df_rag = pd.DataFrame(rag_items)
-        preferred = [
-            "score",
-            "case_id",
-            "type",
-            "place",
-            "area",
-            "risk_level",
-            "motive",
-            "victim_age",
-            "victim_sex",
-            "suspect_age",
-            "suspect_sex",
-        ]
-        cols = [c for c in preferred if c in df_rag.columns]
-        if not cols:
-            cols = list(df_rag.columns)
-        st.dataframe(df_rag.reindex(columns=cols), use_container_width=True, hide_index=True)
+        if has_rag_items:
+            st.markdown("#### Top Similar Cases (RAG Index)")
+            df_rag = pd.DataFrame(rag_items)
+            preferred = [
+                "score",
+                "case_id",
+                "type",
+                "place",
+                "area",
+                "law_category",
+                "attempt_status",
+                "weapon",
+                "victim_age",
+                "victim_sex",
+                "victim_race",
+                "suspect_age",
+                "suspect_sex",
+                "suspect_race",
+            ]
+            cols = [c for c in preferred if c in df_rag.columns]
+            if not cols:
+                cols = list(df_rag.columns)
+            st.dataframe(df_rag.reindex(columns=cols), use_container_width=True, hide_index=True)
+
+        if has_saved_items:
+            st.markdown("#### Similar Saved Cases (History)")
+            df_saved = pd.DataFrame(similar_saved_cases)
+            preferred_saved = [
+                "score",
+                "saved_time",
+                "record_id",
+                "type",
+                "weapon",
+                "place",
+                "city",
+                "area",
+                "hour",
+                "is_night",
+                "suspect_age",
+                "suspect_sex",
+                "suspect_race",
+                "group_indicator",
+                "prior_history",
+                "arrest",
+                "domestic",
+                "risk_level",
+                "motive",
+                "motive_confidence",
+                "motive_band",
+                "helpfulness",
+                "feedback_text",
+                "victim_age",
+                "victim_gender",
+                "victim_race",
+            ]
+            saved_cols = [c for c in preferred_saved if c in df_saved.columns]
+            if not saved_cols:
+                saved_cols = list(df_saved.columns)
+            st.dataframe(df_saved.reindex(columns=saved_cols), use_container_width=True, hide_index=True)
     except Exception:
         st.write("Saved RAG evidence could not be rendered as a table.")
 
@@ -488,6 +566,14 @@ def main() -> None:
             ),
             selected_case,
         )
+
+    if selected_case:
+        try:
+            latest_record = get_case_by_id(selected_case.get("id", ""))
+            if isinstance(latest_record, dict):
+                selected_case = firebase_record_to_ui_case(latest_record)
+        except Exception:
+            pass
 
     if selected_case:
         _render_export_button(selected_case)

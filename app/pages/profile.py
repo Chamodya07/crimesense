@@ -312,6 +312,134 @@ def _evidence_distribution_text(df, col: str, limit: int) -> str:
     return ", ".join(f"{label} ({count})" for label, count in counts.items())
 
 
+def _build_rag_display_columns(df):
+    base_cols = [
+        "score",
+        "case_id",
+        "type",
+        "place",
+        "area",
+    ]
+    optional_cols = [
+        "law_category",
+        "attempt_status",
+        "weapon",
+        "victim_age",
+        "victim_sex",
+        "victim_race",
+        "suspect_age",
+        "suspect_sex",
+        "suspect_race",
+    ]
+    display_cols = [col for col in base_cols if col in df.columns]
+    for col in optional_cols:
+        if _should_show_evidence_column(df, col):
+            display_cols.append(col)
+    return display_cols
+
+
+def _build_saved_display_columns(df):
+    preferred_saved_cols = [
+        "score",
+        "saved_time",
+        "record_id",
+        "type",
+        "weapon",
+        "place",
+        "city",
+        "area",
+        "hour",
+        "is_night",
+        "suspect_age",
+        "suspect_sex",
+        "suspect_race",
+        "group_indicator",
+        "prior_history",
+        "arrest",
+        "domestic",
+        "risk_level",
+        "motive",
+        "motive_confidence",
+        "motive_band",
+        "helpfulness",
+        "feedback_text",
+        "victim_age",
+        "victim_gender",
+        "victim_race",
+    ]
+    saved_cols = []
+    for col in preferred_saved_cols:
+        if col in df.columns:
+            non_empty = df[col].apply(lambda x: str(x).strip() not in {"", "nan", "None"}).any()
+            if non_empty:
+                saved_cols.append(col)
+    for col in df.columns:
+        if col == "_raw" or col in saved_cols:
+            continue
+        non_empty = df[col].apply(lambda x: str(x).strip() not in {"", "nan", "None"}).any()
+        if non_empty:
+            saved_cols.append(col)
+    return saved_cols
+
+
+def _build_rag_summary(df) -> dict[str, object]:
+    summary: dict[str, object] = {}
+    top_score = None
+    if "score" in df.columns and not df.empty:
+        top_score = df["score"].apply(_safe_float).dropna().max()
+    summary["evidence_strength"] = _rag_evidence_strength_band(top_score)
+
+    for key, col in (
+        ("most_common_type", "type"),
+        ("most_common_place", "place"),
+        ("most_common_area", "area"),
+        ("most_common_weapon", "weapon"),
+        ("most_common_victim_age", "victim_age"),
+        ("most_common_victim_sex", "victim_sex"),
+        ("most_common_victim_race", "victim_race"),
+        ("most_common_suspect_age", "suspect_age"),
+        ("most_common_suspect_sex", "suspect_sex"),
+        ("most_common_suspect_race", "suspect_race"),
+    ):
+        value = _most_common_evidence_value(df, col)
+        if value:
+            summary[key] = value
+
+    law_category_dist = _evidence_distribution_text(df, "law_category", 3)
+    if law_category_dist:
+        summary["law_category_distribution"] = law_category_dist
+
+    attempt_status_dist = _evidence_distribution_text(df, "attempt_status", 2)
+    if attempt_status_dist:
+        summary["attempt_status_distribution"] = attempt_status_dist
+
+    return summary
+
+
+def _rag_summary_lines(summary: dict[str, object]) -> list[str]:
+    lines = []
+    mapping = [
+        ("evidence_strength", "Evidence strength"),
+        ("most_common_type", "Most common type"),
+        ("most_common_place", "Most common place"),
+        ("most_common_area", "Most common area"),
+        ("law_category_distribution", "Law category distribution"),
+        ("attempt_status_distribution", "Attempt status distribution"),
+        ("most_common_weapon", "Most common weapon"),
+        ("most_common_victim_age", "Most common victim age"),
+        ("most_common_victim_sex", "Most common victim sex"),
+        ("most_common_victim_race", "Most common victim race"),
+        ("most_common_suspect_age", "Most common suspect age"),
+        ("most_common_suspect_sex", "Most common suspect sex"),
+        ("most_common_suspect_race", "Most common suspect race"),
+    ]
+    for key, label in mapping:
+        value = summary.get(key)
+        if value in (None, ""):
+            continue
+        lines.append(f"{label}: {value}")
+    return lines
+
 def _band_from_confidence(confidence: float | None) -> str | None:
     if confidence is None:
         return None
@@ -825,6 +953,9 @@ def main() -> None:
         saved_message: str | None = None
         saved_message_level = "info"
         saved_debug: dict = {}
+        rag_summary_to_save: dict[str, object] = {}
+        rag_top_cases_to_save: list[dict] = []
+        rag_similar_saved_cases_to_save: list[dict] = []
 
         def _pick_case_value(source: dict, *keys: str):
             for key in keys:
@@ -1025,73 +1156,10 @@ def main() -> None:
         st.markdown("#### Top Similar Cases (RAG Index)")
         if sim_cases:
             df_sim = _sanitize_evidence_display_df(pd.DataFrame(sim_cases))
-            base_cols = [
-                "score",
-                "case_id",
-                "type",
-                "place",
-                "area",
-            ]
-            optional_cols = [
-                "weapon",
-                "hour",
-                "attempt_status",
-                "law_category",
-                "victim_age",
-                "victim_sex",
-                "victim_race",
-                "suspect_age",
-                "suspect_sex",
-                "suspect_race",
-            ]
-
-            display_cols = [col for col in base_cols if col in df_sim.columns]
-            for col in optional_cols:
-                if _should_show_evidence_column(df_sim, col):
-                    display_cols.append(col)
-
-            summary_lines = []
-            top_score = None
-            if "score" in df_sim.columns and not df_sim.empty:
-                top_score = df_sim["score"].apply(_safe_float).dropna().max()
-            summary_lines.append(f"Evidence strength: {_rag_evidence_strength_band(top_score)}")
-
-            most_common_type = _most_common_evidence_value(df_sim, "type")
-            if most_common_type:
-                summary_lines.append(f"Most common type: {most_common_type}")
-
-            most_common_place = _most_common_evidence_value(df_sim, "place")
-            if most_common_place:
-                summary_lines.append(f"Most common place: {most_common_place}")
-
-            most_common_area = _most_common_evidence_value(df_sim, "area")
-            if most_common_area:
-                summary_lines.append(f"Most common area: {most_common_area}")
-
-            law_category_dist = _evidence_distribution_text(df_sim, "law_category", 3)
-            if law_category_dist:
-                summary_lines.append(f"Law category distribution: {law_category_dist}")
-
-            attempt_status_dist = _evidence_distribution_text(df_sim, "attempt_status", 2)
-            if attempt_status_dist:
-                summary_lines.append(f"Attempt status distribution: {attempt_status_dist}")
-
-            most_common_weapon = _most_common_evidence_value(df_sim, "weapon")
-            if most_common_weapon:
-                summary_lines.append(f"Most common weapon: {most_common_weapon}")
-
-            for label, col in (
-                ("Most common victim age", "victim_age"),
-                ("Most common victim sex", "victim_sex"),
-                ("Most common victim race", "victim_race"),
-                ("Most common suspect age", "suspect_age"),
-                ("Most common suspect sex", "suspect_sex"),
-                ("Most common suspect race", "suspect_race"),
-            ):
-                value = _most_common_evidence_value(df_sim, col)
-                if value:
-                    summary_lines.append(f"{label}: {value}")
-
+            display_cols = _build_rag_display_columns(df_sim)
+            rag_summary_to_save = _build_rag_summary(df_sim)
+            summary_lines = _rag_summary_lines(rag_summary_to_save)
+            rag_top_cases_to_save = df_sim.reindex(columns=display_cols).head(10).to_dict(orient="records")
             st.markdown("**RAG Summary**")
             st.markdown("\n".join(f"- {line}" for line in summary_lines))
             st.dataframe(df_sim.reindex(columns=display_cols))
@@ -1101,46 +1169,8 @@ def main() -> None:
         st.markdown("#### Similar Saved Cases (History)")
         if saved_sim_cases:
             df_saved = pd.DataFrame(saved_sim_cases)
-            preferred_saved_cols = [
-                "score",
-                "saved_time",
-                "record_id",
-                "type",
-                "weapon",
-                "place",
-                "city",
-                "area",
-                "hour",
-                "is_night",
-                "suspect_age",
-                "suspect_sex",
-                "suspect_race",
-                "group_indicator",
-                "prior_history",
-                "arrest",
-                "domestic",
-                "risk_level",
-                "motive",
-                "motive_confidence",
-                "motive_band",
-                "helpfulness",
-                "feedback_text",
-                "victim_age",
-                "victim_gender",
-                "victim_race",
-            ]
-            saved_cols = []
-            for col in preferred_saved_cols:
-                if col in df_saved.columns:
-                    non_empty = df_saved[col].apply(lambda x: str(x).strip() not in {"", "nan", "None"}).any()
-                    if non_empty:
-                        saved_cols.append(col)
-            for col in df_saved.columns:
-                if col == "_raw" or col in saved_cols:
-                    continue
-                non_empty = df_saved[col].apply(lambda x: str(x).strip() not in {"", "nan", "None"}).any()
-                if non_empty:
-                    saved_cols.append(col)
+            saved_cols = _build_saved_display_columns(df_saved)
+            rag_similar_saved_cases_to_save = df_saved.reindex(columns=saved_cols).head(10).to_dict(orient="records")
             st.dataframe(df_saved.reindex(columns=saved_cols))
         else:
             if saved_message_level == "warning" and saved_message:
@@ -1250,6 +1280,13 @@ def main() -> None:
                 if isinstance(item, dict):
                     rag_results_to_save.append(make_json_safe(item))
 
+        rag_payload = {
+            "dataset": case_dict.get("city", ""),
+            "summary": rag_summary_to_save,
+            "top_cases": rag_top_cases_to_save,
+            "similar_saved_cases": rag_similar_saved_cases_to_save,
+        }
+
         record_timestamp = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
         record_payload = {
             "created_at_local": record_timestamp,
@@ -1257,6 +1294,7 @@ def main() -> None:
             "narrative_text": narrative or "",
             "outputs": make_json_safe(outputs_to_save),
             "rag_results": rag_results_to_save,
+            "rag": rag_payload,
             "feedback": {
                 "text": feedback_text or "",
                 "helpful": helpfulness or None,
@@ -1272,7 +1310,7 @@ def main() -> None:
                 try:
                     import services.audit_service as audit_service
                     from services.case_id_service import generate_case_id
-                    from services.firebase_service import init_firebase, save_history_record
+                    from services.firebase_service import firestore_safe, init_firebase, save_case_by_id
 
                     init_firebase()
                     firebase_ready = True
@@ -1284,6 +1322,7 @@ def main() -> None:
                         "narrative_text": narrative or "",
                         "outputs": outputs_to_save,
                         "rag_results": rag_results_to_save,
+                        "rag": rag_payload,
                         "feedback": {
                             "text": feedback_text or "",
                             "helpful": helpfulness or None,
@@ -1291,9 +1330,10 @@ def main() -> None:
                     }
                     save_case_id = generate_case_id(record_payload["inputs"].get("city", ""), utc_now)
                     record_payload["case_id"] = save_case_id
-                    doc_id = save_history_record(record_payload)
+                    record_payload = firestore_safe(record_payload)
+                    save_case_by_id(save_case_id, record_payload)
                     st.caption(f"Firestore collection: {firestore_collection} | init_firebase: ok")
-                    st.success(f"Saved: {doc_id}")
+                    st.success(f"Saved: {save_case_id}")
 
                     try:
                         audit_logged = audit_service.log_event(

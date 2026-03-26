@@ -79,6 +79,7 @@ def _base_ui_case(
     structured: dict[str, Any],
     outputs: dict[str, Any],
     similar_cases: list[Any],
+    rag_payload: dict[str, Any],
     feedback: dict[str, Any],
     narrative_text: str,
     raw_record: dict[str, Any],
@@ -172,6 +173,7 @@ def _base_ui_case(
         "inputs_full": make_json_safe(structured),
         "outputs_full": make_json_safe(outputs),
         "similar_cases_full": make_json_safe(similar_cases),
+        "rag_full": make_json_safe(rag_payload),
         "feedback_full": make_json_safe(feedback),
         "created_at_local": created_display,
         "_raw": raw_record,
@@ -195,6 +197,10 @@ def firebase_record_to_ui_case(rec: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(similar_cases, list):
         similar_cases = []
 
+    rag_payload = rec.get("rag") or {}
+    if not isinstance(rag_payload, dict):
+        rag_payload = {}
+
     feedback = rec.get("feedback") or {}
     if not isinstance(feedback, dict):
         feedback = {}
@@ -209,6 +215,7 @@ def firebase_record_to_ui_case(rec: dict[str, Any]) -> dict[str, Any]:
         structured=structured,
         outputs=outputs if isinstance(outputs, dict) else {},
         similar_cases=similar_cases,
+        rag_payload=rag_payload,
         feedback=feedback,
         narrative_text=_clean_text(rec.get("narrative_text")),
         raw_record=rec,
@@ -228,6 +235,10 @@ def _storage_record_to_ui_case(rec: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(similar_cases, list):
         similar_cases = []
 
+    rag_payload = rec.get("rag") or {}
+    if not isinstance(rag_payload, dict):
+        rag_payload = {}
+
     reviewer_notes = _clean_text(rec.get("reviewer_notes"))
     feedback = {"text": reviewer_notes} if reviewer_notes else {}
 
@@ -239,6 +250,7 @@ def _storage_record_to_ui_case(rec: dict[str, Any]) -> dict[str, Any]:
         structured=structured,
         outputs=outputs,
         similar_cases=similar_cases,
+        rag_payload=rag_payload,
         feedback=feedback,
         narrative_text=_clean_text(rec.get("narrative_input")),
         raw_record=rec,
