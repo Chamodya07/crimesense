@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.utils_paths import get_project_root, get_rag_artifacts_dir
+from services.utils_paths import get_project_root
 
 
 def _resolve_to_root(path_value: str) -> Path:
@@ -36,7 +36,7 @@ def main() -> None:
 
     project_root = get_project_root()
     input_path = _resolve_to_root(args.input)
-    out_dir = get_rag_artifacts_dir()
+    out_dir = _resolve_to_root(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=== RAG BUILD (LOCAL) ===")
@@ -45,9 +45,6 @@ def main() -> None:
     print(f"input_exists: {input_path.exists()}")
     print(f"output_dir: {out_dir}")
     print(f"dataset_mode: {args.dataset}")
-    if args.out and args.out != "artifacts/rag":
-        print(f"note: --out={args.out} ignored; writing to canonical {out_dir}")
-
     if not input_path.exists():
         raise FileNotFoundError(f"Input dataset not found: {input_path}")
 
@@ -95,6 +92,8 @@ def main() -> None:
     print(f"Source file: {result['source_file']}")
     print(f"faiss.index exists: {index_path.exists()}")
     print(f"cases.csv exists: {cases_path.exists()}")
+    print(f"final_faiss_index: {index_path}")
+    print(f"final_cases_csv: {cases_path}")
     print("SUCCESS")
     print(f"{index_path}")
     print(f"{cases_path}")

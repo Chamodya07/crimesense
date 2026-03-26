@@ -177,6 +177,130 @@ def _safe_float(value):
         return None
 
 
+def _resolve_city_cases_csv(city: str) -> Path:
+    normalized_city = str(city or "").strip().upper()
+    if "NYPD" in normalized_city:
+        return _ROOT / "artifacts" / "rag" / "nypd" / "cases.csv"
+    if "LA" in normalized_city:
+        return _ROOT / "artifacts" / "rag" / "la" / "cases.csv"
+    return _ROOT / "artifacts" / "rag" / "cases.csv"
+
+
+@st.cache_data(show_spinner=False)
+def load_primary_types(cases_csv: str) -> list[str]:
+    values = load_unique_values(cases_csv, "type")
+    display_to_original: dict[str, str] = {}
+    for raw_text in values:
+        display_text = raw_text.title()
+        display_to_original.setdefault(display_text, raw_text)
+    return sorted(display_to_original.keys())
+
+
+@st.cache_data(show_spinner=False)
+def load_unique_values(cases_csv: str, col: str) -> list[str]:
+    csv_path = Path(cases_csv)
+    if not csv_path.exists():
+        return []
+
+    try:
+        import pandas as pd  # type: ignore
+
+        values_df = pd.read_csv(csv_path, usecols=[col])
+    except Exception:
+        return []
+
+    values: set[str] = set()
+    for raw_value in values_df[col].dropna().tolist():
+        text = str(raw_value).strip()
+        if text:
+            values.add(text)
+    return sorted(values)
+
+
+def load_places(cases_csv: str) -> list[str]:
+    return load_unique_values(cases_csv, "place") or ["Unknown"]
+
+
+@st.cache_data(show_spinner=False)
+def load_la_weapons() -> list[str]:
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        return ["Unknown"]
+
+    la_cases_csv = _ROOT / "artifacts" / "rag" / "la" / "cases.csv"
+    if not la_cases_csv.exists():
+        return ["Unknown"]
+
+    try:
+        la_df = pd.read_csv(la_cases_csv, usecols=["weapon"])
+    except Exception:
+        return ["Unknown"]
+
+    invalid_values = {"", "UNKNOWN", "NONE", "NAN", "NULL", "N/A", "NA"}
+    weapon_values: set[str] = set()
+    for raw_value in la_df["weapon"].dropna().tolist():
+        text = str(raw_value).strip()
+        if not text or text.upper() in invalid_values:
+            continue
+        weapon_values.add(text)
+
+    ordered_values = sorted(weapon_values)
+    return ["Unknown", *ordered_values]
+
+
+def _is_missing_evidence_value(value) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    if not text:
+        return True
+    return text.lower() in {"nan", "none", "unknown", "null"}
+
+
+def _sanitize_evidence_display_df(df):
+    display_df = df.copy()
+    for col in display_df.columns:
+        if col == "score":
+            display_df[col] = display_df[col].apply(
+                lambda value: round(float(value), 3) if _safe_float(value) is not None else value
+            )
+            continue
+        display_df[col] = display_df[col].apply(lambda value: "" if _is_missing_evidence_value(value) else value)
+    return display_df
+
+
+def _should_show_evidence_column(df, col: str) -> bool:
+    if col not in df.columns or df.empty:
+        return False
+    missing_ratio = df[col].apply(_is_missing_evidence_value).mean()
+    return float(missing_ratio) <= 0.8
+
+
+def _most_common_evidence_value(df, col: str) -> str:
+    if col not in df.columns or df.empty:
+        return ""
+    series = df[col].apply(lambda value: "" if _is_missing_evidence_value(value) else str(value).strip())
+    series = series[series != ""]
+    if series.empty:
+        return ""
+    mode_values = series.mode()
+    if mode_values.empty:
+        return ""
+    return str(mode_values.iloc[0]).strip()
+
+
+def _rag_evidence_strength_band(top_score) -> str:
+    score = _safe_float(top_score)
+    if score is None:
+        return "Low"
+    if score >= 0.75:
+        return "Strong"
+    if score >= 0.6:
+        return "Medium"
+    return "Low"
+
+
 def _band_from_confidence(confidence: float | None) -> str | None:
     if confidence is None:
         return None
@@ -325,24 +449,42 @@ def main() -> None:
     form_data: dict = {}
     # Incident Details
     with st.expander("Incident Details", expanded=True):
-        form_data["city"] = st.text_input("City", value="Chicago")
+        form_data["city"] = st.selectbox(
+            "City",
+            options=["NYPD (New York)", "LA (Los Angeles)"],
+        )
         # primary_type selectbox with ability to specify custom
-        crime_options = ["", "Theft", "Assault", "Robbery", "Burglary", "Homicide", "Other"]
-        primary_choice = st.selectbox("Primary type", options=crime_options)
+        fallback_crime_options = ["", "Theft", "Assault", "Robbery", "Burglary", "Homicide", "Other"]
+        cases_csv_path = _resolve_city_cases_csv(form_data["city"])
+        crime_options = load_primary_types(str(cases_csv_path))
+        if not crime_options:
+            crime_options = fallback_crime_options
+        primary_type_key = "profile_primary_type"
+        if st.session_state.get(primary_type_key) not in crime_options:
+            st.session_state[primary_type_key] = crime_options[0]
+        primary_choice = st.selectbox("Primary type", options=crime_options, key=primary_type_key)
         if primary_choice == "Other":
             form_data["primary_type"] = st.text_input("Specify crime type")
         else:
             form_data["primary_type"] = primary_choice
         # location description
-        loc_options = ["", "Street", "Residence", "Business", "Park", "Other"]
-        loc_choice = st.selectbox("Location description", options=loc_options)
-        if loc_choice == "Other":
-            form_data["location_desc"] = st.text_input("Specify location description")
-        else:
-            form_data["location_desc"] = loc_choice
+        place_options = load_places(str(cases_csv_path))
+        location_key = "profile_location_desc"
+        if st.session_state.get(location_key) not in place_options:
+            st.session_state[location_key] = place_options[0]
+        form_data["location_desc"] = st.selectbox(
+            "Location description",
+            options=place_options,
+            key=location_key,
+        )
+        weapon_options = load_la_weapons()
+        weapon_key = "profile_weapon_desc"
+        if st.session_state.get(weapon_key) not in weapon_options:
+            st.session_state[weapon_key] = "Unknown" if "Unknown" in weapon_options else weapon_options[0]
         form_data["weapon_desc"] = st.selectbox(
             "Weapon description",
-            options=["", "None", "Knife", "Gun", "Blunt", "Unknown", "Other"],
+            options=weapon_options,
+            key=weapon_key,
         )
         form_data["arrest"] = st.checkbox("Arrest made", value=False)
         form_data["domestic"] = st.checkbox("Domestic incident", value=False)
@@ -887,7 +1029,7 @@ def main() -> None:
         st.markdown("### Similar Past Cases (RAG Evidence)")
         st.markdown("#### Top Similar Cases (RAG Index)")
         if sim_cases:
-            df_sim = pd.DataFrame(sim_cases)
+            df_sim = _sanitize_evidence_display_df(pd.DataFrame(sim_cases))
             base_cols = [
                 "score",
                 "case_id",
@@ -895,7 +1037,11 @@ def main() -> None:
                 "place",
                 "area",
             ]
-            extra_cols = [
+            optional_cols = [
+                "weapon",
+                "hour",
+                "attempt_status",
+                "law_category",
                 "victim_age",
                 "victim_sex",
                 "victim_race",
@@ -904,12 +1050,18 @@ def main() -> None:
                 "suspect_race",
             ]
 
+            summary_parts = []
+            for label, col in (("Type", "type"), ("Place", "place"), ("Area", "area")):
+                most_common = _most_common_evidence_value(df_sim, col)
+                if most_common:
+                    summary_parts.append(f"{label}: {most_common}")
+            top_score = df_sim["score"].iloc[0] if "score" in df_sim.columns and not df_sim.empty else None
+            summary_parts.append(f"Evidence strength: {_rag_evidence_strength_band(top_score)}")
+            st.caption("RAG Evidence Summary: " + " | ".join(summary_parts))
+
             display_cols = [col for col in base_cols if col in df_sim.columns]
-            for col in extra_cols:
-                if col not in df_sim.columns:
-                    continue
-                non_empty = df_sim[col].apply(lambda x: str(x).strip() not in {"", "nan", "None"}).any()
-                if non_empty:
+            for col in optional_cols:
+                if _should_show_evidence_column(df_sim, col):
                     display_cols.append(col)
             st.dataframe(df_sim.reindex(columns=display_cols))
         else:

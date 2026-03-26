@@ -54,14 +54,18 @@ def _get_cache_decorator():
 
 
 @_get_cache_decorator()
-def load_index() -> Tuple[faiss.Index, pd.DataFrame, SentenceTransformer]:
-    if not INDEX_PATH.exists():
-        raise FileNotFoundError(f"Missing RAG artifact: {INDEX_PATH}")
-    if not CASES_PATH.exists():
-        raise FileNotFoundError(f"Missing RAG artifact: {CASES_PATH}")
+def load_index(rag_dir: str | Path | None = None) -> Tuple[faiss.Index, pd.DataFrame, SentenceTransformer]:
+    active_rag_dir = Path(rag_dir) if rag_dir else RAG_DIR
+    index_path = active_rag_dir / "faiss.index"
+    cases_path = active_rag_dir / "cases.csv"
 
-    index = faiss.read_index(str(INDEX_PATH))
-    cases_df = pd.read_csv(CASES_PATH)
+    if not index_path.exists():
+        raise FileNotFoundError(f"Missing RAG artifact: {index_path}")
+    if not cases_path.exists():
+        raise FileNotFoundError(f"Missing RAG artifact: {cases_path}")
+
+    index = faiss.read_index(str(index_path))
+    cases_df = pd.read_csv(cases_path)
     try:
         model = SentenceTransformer(EMBED_MODEL_NAME)
     except Exception as exc:  # noqa: BLE001
@@ -94,6 +98,19 @@ def _jsonish(value: Any) -> Any:
 
 def _query_primary_type(case_dict: Dict[str, Any]) -> str:
     return _field_text(case_dict.get("primary_type") or case_dict.get("type"))
+
+
+def resolve_rag_dir(city: str) -> Path:
+    normalized_city = _field_text(city).lower()
+    if "chicago" in normalized_city:
+        chicago_dir = RAG_DIR / "chicago"
+        if chicago_dir.is_dir():
+            return chicago_dir
+    if "nypd" in normalized_city or "new york" in normalized_city or "nyc" in normalized_city:
+        return RAG_DIR / "nypd"
+    if "los angeles" in normalized_city or normalized_city == "la":
+        return RAG_DIR / "la"
+    return RAG_DIR
 
 
 def _query_text_from_profile(case_dict: Dict[str, Any]) -> str:
@@ -135,14 +152,33 @@ def retrieve_similar_cases(
     # similarity is driven by structured profile fields only.
     _ = narrative_text
     if top_k <= 0:
-        return [], None
+        return [], "RAG ZERO RESULTS: top_k <= 0"
 
+    city_value = (case_dict or {}).get("city", "")
+    rag_dir = resolve_rag_dir(city_value)
+    index_path = rag_dir / "faiss.index"
+    cases_path = rag_dir / "cases.csv"
+    print("RAG DEBUG city=", city_value)
+    print("RAG DEBUG rag_dir=", rag_dir)
+    print("RAG DEBUG index_path=", index_path, "exists=", index_path.exists())
+    print("RAG DEBUG cases_path=", cases_path, "exists=", cases_path.exists())
+    if not index_path.exists() or not cases_path.exists():
+        return [], f"RAG INDEX MISSING: expected {index_path} and {cases_path}"
     try:
-        index, cases_df, model = load_index()
+        index, cases_df, model = load_index(str(rag_dir))
     except FileNotFoundError:
-        return [], "RAG index artifacts are missing. Build the local index to enable similar case retrieval."
+        return [], f"RAG INDEX MISSING: expected {index_path} and {cases_path}"
     except Exception as exc:  # noqa: BLE001
         return [], f"RAG retrieval unavailable: {exc}"
+    print("RAG DEBUG cases rows=", len(cases_df), "cols=", list(cases_df.columns)[:20])
+    if "type" in cases_df.columns:
+        try:
+            top_types = cases_df["type"].astype(str).str.upper().value_counts().head(10).to_dict()
+        except Exception:
+            top_types = {}
+        print("RAG DEBUG top types:", top_types)
+    else:
+        print("RAG DEBUG top types: missing 'type' column")
     query_text = _query_text_from_profile(case_dict or {})
 
     query_emb = model.encode([query_text], convert_to_numpy=True)
@@ -180,6 +216,7 @@ def retrieve_similar_cases(
         if "case_id" not in item:
             item["case_id"] = _jsonish(row.get("case_id", "")) or str(int(idx))
         candidates.append(item)
+    print("RAG DEBUG candidates from FAISS=", len(candidates))
 
     if q_type:
         type_matches = [r for r in candidates if str(r.get("type", "")).strip().upper() == q_type]
@@ -189,20 +226,37 @@ def retrieve_similar_cases(
                 r for r in type_matches if q_place in str(r.get("place", "")).strip().upper()
             ]
 
-        print(
-            f"RAG q_type={q_type} q_place={q_place} "
-            f"candidates={len(candidates)} type_matches={len(type_matches)} place_matches={len(type_place_matches)}"
-        )
-
+        print("RAG DEBUG q_type=", q_type, "q_place=", q_place)
+        print("RAG DEBUG type_matches=", len(type_matches))
+        print("RAG DEBUG type+place_matches=", len(type_place_matches) if q_place else "n/a")
         if q_place and type_place_matches:
-            return type_place_matches[: int(top_k)], None
+            results = type_place_matches[: int(top_k)]
+            print("RAG DEBUG final_returned=", len(results))
+            return results, None
 
         if type_matches:
-            return type_matches[: int(top_k)], None
+            results = type_matches[: int(top_k)]
+            print("RAG DEBUG final_returned=", len(results))
+            return results, None
 
-        return [], None
+        if not candidates:
+            print("RAG DEBUG final_returned=", 0)
+            return [], f"RAG ZERO RESULTS: FAISS returned 0 candidates from {rag_dir}"
+        print("RAG DEBUG fallback_used=unfiltered")
+        results = candidates[: int(top_k)]
+        print("RAG DEBUG final_returned=", len(results))
+        if not results:
+            return [], f"RAG ZERO RESULTS: FAISS returned 0 candidates from {rag_dir}"
+        return results, None
 
-    return candidates[: int(top_k)], None
+    results = candidates[: int(top_k)]
+    print("RAG DEBUG q_type=", q_type, "q_place=", q_place)
+    print("RAG DEBUG type_matches=", "n/a")
+    print("RAG DEBUG type+place_matches=", "n/a")
+    print("RAG DEBUG final_returned=", len(results))
+    if not results:
+        return [], f"RAG ZERO RESULTS: FAISS returned 0 candidates from {rag_dir}"
+    return results, None
 
 
 def clear_index_cache() -> None:
@@ -217,6 +271,7 @@ __all__ = [
     "retrieve_similar_cases",
     "build_query_text",
     "clear_index_cache",
+    "resolve_rag_dir",
     "RAG_DIR",
     "INDEX_PATH",
     "CASES_PATH",

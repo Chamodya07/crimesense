@@ -242,9 +242,7 @@ def build_rag_index_from_file(
     if not input_path.exists():
         raise FileNotFoundError(f"RAG source file not found: {input_path}")
 
-    # Single canonical output for Streamlit consumption.
-    _ = out_dir
-    output_dir = get_rag_artifacts_dir()
+    output_dir = get_rag_artifacts_dir() if out_dir is None else _resolve_to_root(out_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     df = _load_dataframe(input_path, max_rows=max_rows)
