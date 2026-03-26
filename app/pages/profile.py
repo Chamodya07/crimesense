@@ -301,6 +301,17 @@ def _rag_evidence_strength_band(top_score) -> str:
     return "Low"
 
 
+def _evidence_distribution_text(df, col: str, limit: int) -> str:
+    if col not in df.columns or df.empty:
+        return ""
+    series = df[col].apply(lambda value: "" if _is_missing_evidence_value(value) else str(value).strip())
+    series = series[series != ""]
+    if series.empty:
+        return ""
+    counts = series.value_counts().head(limit)
+    return ", ".join(f"{label} ({count})" for label, count in counts.items())
+
+
 def _band_from_confidence(confidence: float | None) -> str | None:
     if confidence is None:
         return None
@@ -891,6 +902,7 @@ def main() -> None:
             is_night_value = None
 
         rag_case_dict = {
+            "city": case_dict.get("city", ""),
             "primary_type": primary_type or "Unknown",
             "weapon_desc": weapon_desc,
             "location_desc": location_desc,
@@ -906,28 +918,11 @@ def main() -> None:
         except Exception:
             rag_query_text = ""
 
-        rag_dir = _ROOT / "artifacts" / "rag"
-        rag_index = rag_dir / "faiss.index"
-        rag_cases = rag_dir / "cases.csv"
-        has_index = rag_index.exists()
-        has_cases = rag_cases.exists()
-        rag_ready = has_index and has_cases
-
-        with st.expander("Debug (RAG paths)"):
-            st.write(f"artifacts/rag (absolute): {rag_dir.resolve()}")
-            st.write(f"faiss.index path: {rag_index.resolve()}")
-            st.write(f"cases.csv path: {rag_cases.resolve()}")
-            st.write(f"faiss.index exists: {has_index}")
-            st.write(f"cases.csv exists: {has_cases}")
-            st.write("rag_case_dict:")
-            st.json(make_json_safe(rag_case_dict))
-            st.write(f"rag_query_text: {rag_query_text}")
-
         try:
             from services.pipeline_service import get_evidence_bundle
             from services.firebase_service import list_history_records
 
-            evidence_bundle = get_evidence_bundle(rag_case_dict, narrative, fused_output=fused, top_k=5)
+            evidence_bundle = get_evidence_bundle(rag_case_dict, narrative, fused_output=fused, top_k=10)
             sim_cases = evidence_bundle.get("rag", []) or evidence_bundle.get("rag_results", []) or []
             rag_message = evidence_bundle.get("rag_message")
             warning_list = evidence_bundle.get("warnings", []) or []
@@ -1050,19 +1045,55 @@ def main() -> None:
                 "suspect_race",
             ]
 
-            summary_parts = []
-            for label, col in (("Type", "type"), ("Place", "place"), ("Area", "area")):
-                most_common = _most_common_evidence_value(df_sim, col)
-                if most_common:
-                    summary_parts.append(f"{label}: {most_common}")
-            top_score = df_sim["score"].iloc[0] if "score" in df_sim.columns and not df_sim.empty else None
-            summary_parts.append(f"Evidence strength: {_rag_evidence_strength_band(top_score)}")
-            st.caption("RAG Evidence Summary: " + " | ".join(summary_parts))
-
             display_cols = [col for col in base_cols if col in df_sim.columns]
             for col in optional_cols:
                 if _should_show_evidence_column(df_sim, col):
                     display_cols.append(col)
+
+            summary_lines = []
+            top_score = None
+            if "score" in df_sim.columns and not df_sim.empty:
+                top_score = df_sim["score"].apply(_safe_float).dropna().max()
+            summary_lines.append(f"Evidence strength: {_rag_evidence_strength_band(top_score)}")
+
+            most_common_type = _most_common_evidence_value(df_sim, "type")
+            if most_common_type:
+                summary_lines.append(f"Most common type: {most_common_type}")
+
+            most_common_place = _most_common_evidence_value(df_sim, "place")
+            if most_common_place:
+                summary_lines.append(f"Most common place: {most_common_place}")
+
+            most_common_area = _most_common_evidence_value(df_sim, "area")
+            if most_common_area:
+                summary_lines.append(f"Most common area: {most_common_area}")
+
+            law_category_dist = _evidence_distribution_text(df_sim, "law_category", 3)
+            if law_category_dist:
+                summary_lines.append(f"Law category distribution: {law_category_dist}")
+
+            attempt_status_dist = _evidence_distribution_text(df_sim, "attempt_status", 2)
+            if attempt_status_dist:
+                summary_lines.append(f"Attempt status distribution: {attempt_status_dist}")
+
+            most_common_weapon = _most_common_evidence_value(df_sim, "weapon")
+            if most_common_weapon:
+                summary_lines.append(f"Most common weapon: {most_common_weapon}")
+
+            for label, col in (
+                ("Most common victim age", "victim_age"),
+                ("Most common victim sex", "victim_sex"),
+                ("Most common victim race", "victim_race"),
+                ("Most common suspect age", "suspect_age"),
+                ("Most common suspect sex", "suspect_sex"),
+                ("Most common suspect race", "suspect_race"),
+            ):
+                value = _most_common_evidence_value(df_sim, col)
+                if value:
+                    summary_lines.append(f"{label}: {value}")
+
+            st.markdown("**RAG Summary**")
+            st.markdown("\n".join(f"- {line}" for line in summary_lines))
             st.dataframe(df_sim.reindex(columns=display_cols))
         else:
             st.info(rag_message or "No similar cases found / index missing.")
