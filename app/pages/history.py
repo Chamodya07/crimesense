@@ -1,9 +1,7 @@
 ﻿from __future__ import annotations
 
 import sys
-from io import BytesIO
 from pathlib import Path
-from xml.sax.saxutils import escape
 
 import streamlit as st
 
@@ -14,29 +12,8 @@ if str(_ROOT) not in sys.path:
 
 from services.auth_service import render_auth_status
 from services.firebase_service import get_case_by_id, list_history_records
+from services.export_service import build_profile_doc
 from services.history_service import firebase_record_to_ui_case, load_history_cases
-
-try:
-    from docx import Document
-
-    DOCX_AVAILABLE = True
-except ImportError:
-    Document = None
-    DOCX_AVAILABLE = False
-
-try:
-    from reportlab.lib.pagesizes import letter
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
-
-    PDF_AVAILABLE = True
-except ImportError:
-    letter = None
-    getSampleStyleSheet = None
-    Paragraph = None
-    SimpleDocTemplate = None
-    Spacer = None
-    PDF_AVAILABLE = False
 
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
@@ -76,6 +53,36 @@ def seed_cases():
 
 def _format_case_label(case: dict) -> str:
     return f"Case ID: {case.get('id', '-')} | {case.get('title', 'Unknown')} | {case.get('date', '-')}"
+
+
+def _normalize_dataset_group(city_value: object, dataset_value: object) -> str:
+    city = str(city_value or "").strip().lower()
+    dataset_id = str(dataset_value or "").strip().lower()
+
+    if dataset_id == "nypd" or "nypd" in city or "new york" in city or "ny" in city:
+        return "nypd"
+    if dataset_id == "la" or "los angeles" in city or city == "la" or "la" in city:
+        return "la"
+    return "other"
+
+
+def _case_dataset_group(case: dict) -> str:
+    raw_record = case.get("_raw") if isinstance(case.get("_raw"), dict) else {}
+    raw_inputs = raw_record.get("inputs") if isinstance(raw_record.get("inputs"), dict) else {}
+
+    city_value = (
+        raw_record.get("city")
+        or raw_inputs.get("city")
+        or (case.get("inputs_full") or {}).get("city")
+        or ""
+    )
+    dataset_value = (
+        raw_record.get("rag_dataset")
+        or raw_record.get("dataset_id")
+        or (raw_record.get("rag") or {}).get("dataset")
+        or ""
+    )
+    return _normalize_dataset_group(city_value, dataset_value)
 
 
 def _humanize_key(key: object) -> str:
@@ -178,8 +185,8 @@ def _render_rag_evidence(case: dict) -> None:
             "most_common_type",
             "most_common_place",
             "most_common_area",
-            "law_category_distribution",
-            "attempt_status_distribution",
+            "most_common_law_category",
+            "most_common_attempt_status",
             "most_common_weapon",
             "most_common_victim_age",
             "most_common_victim_sex",
@@ -268,137 +275,40 @@ def _render_export_button(case: dict) -> None:
         for char in str(case.get("id") or "case")
     )
     button_col, _ = st.columns([0.22, 0.78])
-    if DOCX_AVAILABLE:
-        with button_col:
+    raw_record = case.get("_raw") if isinstance(case.get("_raw"), dict) else {}
+    export_record = {
+        "case_id": case.get("id") or raw_record.get("case_id") or safe_case_id,
+        "timestamp": raw_record.get("created_at_local") or raw_record.get("created_at") or case.get("date"),
+        "inputs": case.get("inputs_full") or raw_record.get("inputs") or {},
+        "outputs": case.get("outputs_full") or raw_record.get("outputs") or {},
+        "rag_summary": (case.get("rag_full") or {}).get("summary") or {},
+        "rag_results": (case.get("rag_full") or {}).get("top_cases") or case.get("similar_cases_full") or [],
+        "similar_saved_cases": (case.get("rag_full") or {}).get("similar_saved_cases") or [],
+        "feedback": case.get("feedback_full") or raw_record.get("feedback") or {},
+        "rag": case.get("rag_full") or raw_record.get("rag") or {},
+        "narrative_text": raw_record.get("narrative_text") or case.get("description") or "",
+    }
+    export_error = None
+    export_bytes = None
+    try:
+        export_bytes = build_profile_doc(export_record)
+    except Exception as exc:  # noqa: BLE001
+        export_error = str(exc)
+    with button_col:
+        if export_bytes is not None:
             st.download_button(
-                "Export DOCX",
-                data=build_case_docx(case),
-                file_name=f"{safe_case_id}.docx",
+                "Export",
+                data=export_bytes,
+                file_name=f"{safe_case_id}_report.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
-        return
-
-    if PDF_AVAILABLE:
-        with button_col:
-            st.download_button(
-                "Export PDF",
-                data=build_case_pdf(case),
-                file_name=f"{safe_case_id}.pdf",
-                mime="application/pdf",
-            )
-        return
-
-    with button_col:
-        st.download_button(
-            "Export RTF",
-            data=build_case_rtf(case),
-            file_name=f"{safe_case_id}.rtf",
-            mime="application/rtf",
-        )
-
-
-def build_case_docx(case: dict) -> bytes:
-    """Create a simple Word document for a case export."""
-    if not DOCX_AVAILABLE or Document is None:
-        raise RuntimeError("python-docx is not installed")
-    doc = Document()
-    doc.add_heading(case["title"], level=1)
-
-    doc.add_paragraph(f"Case ID: {case['id']}")
-    doc.add_paragraph(f"Date: {case['date']}")
-    doc.add_paragraph(f"Location: {case['location']}")
-    doc.add_paragraph(f"Risk: {case['risk']}")
-
-    doc.add_heading("Victim / profile info", level=2)
-    doc.add_paragraph(f"Victim: {case['victim']}")
-    age_value = case.get("age", "--") if case.get("age") is not None else "--"
-    doc.add_paragraph(f"Age: {age_value}")
-    doc.add_paragraph(f"Gender: {case.get('gender', '--')}")
-
-    doc.add_heading("Description", level=2)
-    doc.add_paragraph(case["description"])
-
-    doc.add_heading("Notes / recommendations", level=2)
-    doc.add_paragraph(case["notes"])
-
-    buffer = BytesIO()
-    doc.save(buffer)
-    return buffer.getvalue()
-
-
-def build_case_rtf(case: dict) -> bytes:
-    """Create a Word-compatible RTF export without external dependencies."""
-
-    def safe(value: object) -> str:
-        text = str(value) if value is not None else ""
-        text = text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
-        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", r"\line ")
-        return text
-
-    age_value = case.get("age", "--") if case.get("age") is not None else "--"
-    sections = [
-        (r"\b " + safe(case.get("title", "Case Export")) + r"\b0", ""),
-        ("Case ID:", safe(case.get("id", "--"))),
-        ("Date:", safe(case.get("date", "--"))),
-        ("Location:", safe(case.get("location", "--"))),
-        ("Risk:", safe(case.get("risk", "--"))),
-        (r"\b Victim / profile info\b0", ""),
-        ("Victim:", safe(case.get("victim", "--"))),
-        ("Age:", safe(age_value)),
-        ("Gender:", safe(case.get("gender", "--"))),
-        (r"\b Description\b0", ""),
-        ("", safe(case.get("description", ""))),
-        (r"\b Notes / recommendations\b0", ""),
-        ("", safe(case.get("notes", ""))),
-    ]
-
-    lines = [r"{\rtf1\ansi\deff0"]
-    for label, value in sections:
-        if label and value:
-            lines.append(rf"{label} {value}\line ")
-        elif label:
-            lines.append(rf"{label}\line ")
         else:
-            lines.append(rf"{value}\line ")
-    lines.append("}")
-    return "".join(lines).encode("utf-8")
-
-
-def build_case_pdf(case: dict) -> bytes:
-    """Create a simple PDF document for a case export."""
-    if not PDF_AVAILABLE or SimpleDocTemplate is None:
-        raise RuntimeError("reportlab is not installed")
-
-    def safe(value: object) -> str:
-        return escape(str(value)) if value is not None else ""
-
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, title=str(case.get("title", "Case Export")))
-    styles = getSampleStyleSheet()
-    story = [
-        Paragraph(safe(case.get("title", "Case Export")), styles["Title"]),
-        Spacer(1, 12),
-        Paragraph(f"<b>Case ID:</b> {safe(case.get('id', '--'))}", styles["BodyText"]),
-        Paragraph(f"<b>Date:</b> {safe(case.get('date', '--'))}", styles["BodyText"]),
-        Paragraph(f"<b>Location:</b> {safe(case.get('location', '--'))}", styles["BodyText"]),
-        Paragraph(f"<b>Risk:</b> {safe(case.get('risk', '--'))}", styles["BodyText"]),
-        Spacer(1, 10),
-        Paragraph("Victim / profile info", styles["Heading2"]),
-        Paragraph(f"<b>Victim:</b> {safe(case.get('victim', '--'))}", styles["BodyText"]),
-        Paragraph(
-            f"<b>Age:</b> {safe(case.get('age', '--') if case.get('age') is not None else '--')}",
-            styles["BodyText"],
-        ),
-        Paragraph(f"<b>Gender:</b> {safe(case.get('gender', '--'))}", styles["BodyText"]),
-        Spacer(1, 10),
-        Paragraph("Description", styles["Heading2"]),
-        Paragraph(safe(case.get("description", "")), styles["BodyText"]),
-        Spacer(1, 10),
-        Paragraph("Notes / recommendations", styles["Heading2"]),
-        Paragraph(safe(case.get("notes", "")), styles["BodyText"]),
-    ]
-    doc.build(story)
-    return buffer.getvalue()
+            st.button(
+                "Export",
+                disabled=True,
+                key=f"export_history_docx_disabled_{safe_case_id}",
+                help=export_error or "Export unavailable",
+            )
 
 
 def render_case_details(case: dict, show_title: bool = True) -> None:
@@ -495,6 +405,8 @@ def main() -> None:
 
     if "history_search_input" not in st.session_state:
         st.session_state["history_search_input"] = ""
+    if "history_dataset_filter" not in st.session_state:
+        st.session_state["history_dataset_filter"] = "All"
     if "selected_case_id" not in st.session_state:
         st.session_state["selected_case_id"] = None
 
@@ -503,13 +415,20 @@ def main() -> None:
         st.title("Past Predicted Profiles")
         st.caption("Review prior predictions; select a case to view its details.")
     with header_right:
-        s_col, x_col = st.columns([0.82, 0.18], gap="small")
+        s_col, f_col, x_col = st.columns([0.54, 0.30, 0.16], gap="small")
         with s_col:
             st.text_input(
                 "Search cases",
                 placeholder="Search by case ID or crime type",
                 label_visibility="collapsed",
                 key="history_search_input",
+            )
+        with f_col:
+            st.selectbox(
+                "Dataset filter",
+                options=["All", "NYC (NYPD)", "LA"],
+                label_visibility="collapsed",
+                key="history_dataset_filter",
             )
         with x_col:
             st.button("X", help="Clear search and show all cases", on_click=clear_search, key="clear_history_search")
@@ -525,6 +444,11 @@ def main() -> None:
             if query in c["id"].lower()
             or query in c["title"].lower()
         ]
+    dataset_filter = st.session_state.get("history_dataset_filter", "All")
+    if dataset_filter == "NYC (NYPD)":
+        cases = [c for c in cases if _case_dataset_group(c) == "nypd"]
+    elif dataset_filter == "LA":
+        cases = [c for c in cases if _case_dataset_group(c) == "la"]
     cases_sorted = sorted(cases, key=lambda c: c["date"], reverse=True)
 
     selected_case = None
@@ -544,7 +468,7 @@ def main() -> None:
     if not all_cases:
         st.info("No saved cases yet.")
     elif not cases_sorted:
-        st.info("No cases match your search.")
+        st.info("No cases match your search or filter.")
     else:
         selectable_ids = [case.get("_selector_id") for case in cases_sorted if case.get("_selector_id")]
         current_case_id = st.session_state.get("selected_case_id")

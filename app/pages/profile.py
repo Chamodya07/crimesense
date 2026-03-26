@@ -312,18 +312,44 @@ def _evidence_distribution_text(df, col: str, limit: int) -> str:
     return ", ".join(f"{label} ({count})" for label, count in counts.items())
 
 
-def _build_rag_display_columns(df):
-    base_cols = [
+def majority_value(
+    series,
+    min_n: int = 5,
+    min_ratio: float = 0.60,
+    unknown_set: set[str] | None = None,
+):
+    normalized_unknowns = {value.upper() for value in (unknown_set or {"", "UNKNOWN", "N/A", "NONE", "D"})}
+    filtered_values = []
+    for raw_value in series:
+        if raw_value is None:
+            continue
+        text = str(raw_value).strip()
+        if not text or text.upper() in normalized_unknowns:
+            continue
+        filtered_values.append(text)
+
+    sample_size = len(filtered_values)
+    if sample_size < min_n:
+        return None, 0.0
+
+    counts: dict[str, int] = {}
+    for value in filtered_values:
+        counts[value] = counts.get(value, 0) + 1
+
+    top_value, top_count = max(counts.items(), key=lambda item: item[1])
+    ratio = top_count / sample_size
+    if ratio < min_ratio:
+        return None, 0.0
+    return top_value, ratio
+
+
+def _prepare_rag_results_df(df, dataset_id: str | None):
+    required_cols = [
         "score",
         "case_id",
         "type",
         "place",
         "area",
-    ]
-    optional_cols = [
-        "law_category",
-        "attempt_status",
-        "weapon",
         "victim_age",
         "victim_sex",
         "victim_race",
@@ -331,11 +357,27 @@ def _build_rag_display_columns(df):
         "suspect_sex",
         "suspect_race",
     ]
-    display_cols = [col for col in base_cols if col in df.columns]
-    for col in optional_cols:
-        if _should_show_evidence_column(df, col):
-            display_cols.append(col)
-    return display_cols
+    if str(dataset_id or "").strip().lower() == "nypd":
+        required_cols = [
+            "score",
+            "case_id",
+            "type",
+            "place",
+            "area",
+            "law_category",
+            "attempt_status",
+            "victim_age",
+            "victim_sex",
+            "victim_race",
+            "suspect_age",
+            "suspect_sex",
+            "suspect_race",
+        ]
+    display_df = df.copy()
+    for col in required_cols:
+        if col not in display_df.columns:
+            display_df[col] = ""
+    return display_df[required_cols]
 
 
 def _build_saved_display_columns(df):
@@ -383,11 +425,58 @@ def _build_saved_display_columns(df):
 
 
 def _build_rag_summary(df) -> dict[str, object]:
+    return _build_rag_summary_for_dataset(df, dataset_id=None)
+
+
+def _resolve_rag_dataset_id(rag_meta, rag_df) -> str:
+    if isinstance(rag_meta, dict):
+        for key in ("dataset_id", "resolved_dataset"):
+            value = str(rag_meta.get(key) or "").strip().lower()
+            if value:
+                return value
+
+    meta_path = _ROOT / "artifacts" / "rag" / "meta.json"
+    if meta_path.exists():
+        try:
+            file_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            file_meta = {}
+        if isinstance(file_meta, dict):
+            for key in ("dataset_id", "resolved_dataset"):
+                value = str(file_meta.get(key) or "").strip().lower()
+                if value:
+                    return value
+
+    if "law_category" in rag_df.columns or "attempt_status" in rag_df.columns:
+        return "nypd"
+    return "la"
+
+
+def _build_rag_summary_for_dataset(df, dataset_id: str | None) -> dict[str, object]:
     summary: dict[str, object] = {}
     top_score = None
     if "score" in df.columns and not df.empty:
         top_score = df["score"].apply(_safe_float).dropna().max()
     summary["evidence_strength"] = _rag_evidence_strength_band(top_score)
+
+    def most_common_or_none(series):
+        cleaned = (
+            series.astype(str)
+            .replace({"None": "", "nan": "", "NaN": "", "": ""})
+            .str.strip()
+        )
+        cleaned = cleaned[cleaned != ""]
+        return cleaned.value_counts().idxmax() if len(cleaned) else None
+
+    if str(dataset_id or "").strip().lower() == "nypd":
+        if "law_category" in df.columns:
+            most_law = most_common_or_none(df["law_category"])
+            if most_law is not None:
+                summary["most_common_law_category"] = most_law
+        if "attempt_status" in df.columns:
+            most_attempt = most_common_or_none(df["attempt_status"])
+            if most_attempt is not None:
+                summary["most_common_attempt_status"] = most_attempt
 
     for key, col in (
         ("most_common_type", "type"),
@@ -401,17 +490,11 @@ def _build_rag_summary(df) -> dict[str, object]:
         ("most_common_suspect_sex", "suspect_sex"),
         ("most_common_suspect_race", "suspect_race"),
     ):
-        value = _most_common_evidence_value(df, col)
+        if col not in df.columns:
+            continue
+        value, _ = majority_value(df[col])
         if value:
             summary[key] = value
-
-    law_category_dist = _evidence_distribution_text(df, "law_category", 3)
-    if law_category_dist:
-        summary["law_category_distribution"] = law_category_dist
-
-    attempt_status_dist = _evidence_distribution_text(df, "attempt_status", 2)
-    if attempt_status_dist:
-        summary["attempt_status_distribution"] = attempt_status_dist
 
     return summary
 
@@ -423,8 +506,8 @@ def _rag_summary_lines(summary: dict[str, object]) -> list[str]:
         ("most_common_type", "Most common type"),
         ("most_common_place", "Most common place"),
         ("most_common_area", "Most common area"),
-        ("law_category_distribution", "Law category distribution"),
-        ("attempt_status_distribution", "Attempt status distribution"),
+        ("most_common_law_category", "Most common law category"),
+        ("most_common_attempt_status", "Most common attempt status"),
         ("most_common_weapon", "Most common weapon"),
         ("most_common_victim_age", "Most common victim age"),
         ("most_common_victim_sex", "Most common victim sex"),
@@ -953,6 +1036,7 @@ def main() -> None:
         saved_message: str | None = None
         saved_message_level = "info"
         saved_debug: dict = {}
+        rag_meta: dict[str, object] = {}
         rag_summary_to_save: dict[str, object] = {}
         rag_top_cases_to_save: list[dict] = []
         rag_similar_saved_cases_to_save: list[dict] = []
@@ -1056,6 +1140,7 @@ def main() -> None:
             evidence_bundle = get_evidence_bundle(rag_case_dict, narrative, fused_output=fused, top_k=10)
             sim_cases = evidence_bundle.get("rag", []) or evidence_bundle.get("rag_results", []) or []
             rag_message = evidence_bundle.get("rag_message")
+            rag_meta = evidence_bundle.get("rag_meta") or {}
             warning_list = evidence_bundle.get("warnings", []) or []
             if not rag_message:
                 rag_warns = [w for w in warning_list if "rag" in str(w).lower()]
@@ -1156,13 +1241,18 @@ def main() -> None:
         st.markdown("#### Top Similar Cases (RAG Index)")
         if sim_cases:
             df_sim = _sanitize_evidence_display_df(pd.DataFrame(sim_cases))
-            display_cols = _build_rag_display_columns(df_sim)
-            rag_summary_to_save = _build_rag_summary(df_sim)
+            rag_dataset_id = _resolve_rag_dataset_id(rag_meta, df_sim)
+            if rag_dataset_id == "nypd" and "law_category" not in df_sim.columns:
+                df_sim["law_category"] = ""
+            if rag_dataset_id == "nypd" and "attempt_status" not in df_sim.columns:
+                df_sim["attempt_status"] = ""
+            df_sim_display = _prepare_rag_results_df(df_sim, rag_dataset_id).head(10)
+            rag_summary_to_save = _build_rag_summary_for_dataset(df_sim, rag_dataset_id)
             summary_lines = _rag_summary_lines(rag_summary_to_save)
-            rag_top_cases_to_save = df_sim.reindex(columns=display_cols).head(10).to_dict(orient="records")
+            rag_top_cases_to_save = df_sim_display.to_dict(orient="records")
             st.markdown("**RAG Summary**")
             st.markdown("\n".join(f"- {line}" for line in summary_lines))
-            st.dataframe(df_sim.reindex(columns=display_cols))
+            st.dataframe(df_sim_display, use_container_width=True)
         else:
             st.info(rag_message or "No similar cases found / index missing.")
 
@@ -1357,15 +1447,47 @@ def main() -> None:
                     st.error(f"Save failed: {e} | outputs_type={outputs_type} | outputs_keys={outputs_keys}")
 
         with export_col:
-            export_name = f"profile_record_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
-            export_clicked = st.download_button(
-                "Export",
-                data=json.dumps(record_payload_safe, ensure_ascii=False, indent=2),
-                file_name=export_name,
-                mime="application/json",
-                use_container_width=True,
-                key="profile_export_button",
-            )
+            from services.export_service import build_profile_doc
+
+            export_case_id = record_payload_safe.get("case_id") or case_id or "case"
+            export_record = {
+                "case_id": export_case_id,
+                "timestamp": record_payload_safe.get("created_at_local") or record_timestamp,
+                "inputs": record_payload_safe.get("inputs") or {},
+                "outputs": record_payload_safe.get("outputs") or {},
+                "rag_summary": (record_payload_safe.get("rag") or {}).get("summary") or {},
+                "rag_results": (record_payload_safe.get("rag") or {}).get("top_cases") or [],
+                "similar_saved_cases": (record_payload_safe.get("rag") or {}).get("similar_saved_cases") or [],
+                "feedback": record_payload_safe.get("feedback") or {},
+                "rag": record_payload_safe.get("rag") or {},
+                "narrative_text": record_payload_safe.get("narrative_text") or "",
+            }
+            export_name = f"{export_case_id}_report.docx"
+            export_error = None
+            export_bytes = None
+            try:
+                export_bytes = build_profile_doc(export_record)
+            except Exception as exc:  # noqa: BLE001
+                export_error = str(exc)
+
+            if export_bytes is not None:
+                export_clicked = st.download_button(
+                    "Export",
+                    data=export_bytes,
+                    file_name=export_name,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                    key="export_profile_docx",
+                )
+            else:
+                export_clicked = False
+                st.button(
+                    "Export",
+                    disabled=True,
+                    use_container_width=True,
+                    key="export_profile_docx_disabled",
+                    help=export_error or "Export unavailable",
+                )
             if export_clicked:
                 _log_profile_event("export", case_id, fused)
 
