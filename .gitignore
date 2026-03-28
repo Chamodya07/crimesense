@@ -22,6 +22,8 @@ ENV/
 .streamlit/secrets.toml
 secrets/
 kaggle.json
+.codex-gcloud/
+.firebase/
 
 # IDE and OS files
 .vscode/

@@ -134,8 +134,14 @@ body {
   background: transparent;
 }
 
+header[data-testid="stHeader"],
+[data-testid="stToolbar"],
+[data-testid="stDecoration"] {
+  display: none !important;
+}
+
 .block-container {
-  padding-top: 2rem;
+  padding-top: 0 !important;
   padding-bottom: 2rem;
   max-width: 1200px;
 }

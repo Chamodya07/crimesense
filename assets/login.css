@@ -20,12 +20,15 @@ body,
   display: flex;
   flex-direction: column;
   justify-content: center;
-  padding-top: 2rem !important;
+  padding-top: 0 !important;
   padding-bottom: 2rem !important;
 }
 
 header,
+header[data-testid="stHeader"],
 footer,
+[data-testid="stToolbar"],
+[data-testid="stDecoration"],
 [data-testid="stSidebar"],
 [data-testid="stSidebarNav"],
 [data-testid="collapsedControl"] {

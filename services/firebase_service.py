@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import math
 import base64
@@ -16,28 +17,47 @@ class FirebaseConfigError(RuntimeError):
     pass
 
 
+def _normalize_service_account_dict(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise RuntimeError("Firebase service account credentials must be a JSON object.")
+
+    service_account = dict(data)
+    private_key = service_account.get("private_key")
+    if isinstance(private_key, str):
+        normalized_key = private_key.replace("\\n", "\n").strip()
+        if "YOUR_PRIVATE_KEY_HERE" in normalized_key:
+            raise RuntimeError("Firebase private key still contains placeholder text. Replace the .env.yaml placeholders.")
+        if "BEGIN PRIVATE KEY" not in normalized_key or "END PRIVATE KEY" not in normalized_key:
+            raise RuntimeError("Firebase private key is missing the expected PEM header/footer.")
+        service_account["private_key"] = normalized_key + "\n"
+
+    return service_account
+
+
 def _load_service_account_dict() -> Dict[str, Any]:
-    if "FIREBASE_SERVICE_ACCOUNT_JSON" in st.secrets:
-        raw = st.secrets["FIREBASE_SERVICE_ACCOUNT_JSON"]
-        if isinstance(raw, dict):
-            return dict(raw)
+    env_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if env_json:
         try:
-            return json.loads(str(raw))
-        except json.JSONDecodeError as exc:
-            raise FirebaseConfigError("Invalid FIREBASE_SERVICE_ACCOUNT_JSON in Streamlit secrets.") from exc
+            return _normalize_service_account_dict(json.loads(env_json))
+        except json.JSONDecodeError as e:
+            raise RuntimeError("Invalid FIREBASE_SERVICE_ACCOUNT_JSON environment variable.") from e
 
-    if "FIREBASE_SERVICE_ACCOUNT_PATH" in st.secrets:
-        raw_path = Path(str(st.secrets["FIREBASE_SERVICE_ACCOUNT_PATH"]))
-        if not raw_path.is_absolute():
-            raw_path = get_project_root() / raw_path
-        if not raw_path.exists():
-            raise FirebaseConfigError(f"FIREBASE_SERVICE_ACCOUNT_PATH not found: {raw_path}")
-        try:
-            return json.loads(raw_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise FirebaseConfigError(f"Invalid JSON in service account file: {raw_path}") from exc
+    try:
+        if "FIREBASE_SERVICE_ACCOUNT_JSON" in st.secrets:
+            secret_val = st.secrets["FIREBASE_SERVICE_ACCOUNT_JSON"]
+            if isinstance(secret_val, str):
+                return _normalize_service_account_dict(json.loads(secret_val))
+            return _normalize_service_account_dict(dict(secret_val))
 
-    raise FirebaseConfigError("Firebase not configured. Add service account JSON to Streamlit secrets.")
+        if "FIREBASE_SERVICE_ACCOUNT_PATH" in st.secrets:
+            with open(st.secrets["FIREBASE_SERVICE_ACCOUNT_PATH"], "r", encoding="utf-8") as f:
+                return _normalize_service_account_dict(json.load(f))
+    except FileNotFoundError:
+        pass
+
+    raise RuntimeError(
+        "Firebase credentials not found. Set FIREBASE_SERVICE_ACCOUNT_JSON as an environment variable or provide .streamlit/secrets.toml locally."
+    )
 
 
 def _firestore_sanitize(obj: Any) -> Any:

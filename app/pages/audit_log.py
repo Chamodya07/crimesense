@@ -53,6 +53,21 @@ def _format_timestamp(value: Any) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def is_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() in {"", "-", "N/A", "None"}
+    return str(value).strip() in {"", "-", "N/A", "None"}
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if not is_empty(value):
+            return value
+    return ""
+
+
 def _prepare_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
     fallback_data_ver = "N/A"
     try:
@@ -65,6 +80,7 @@ def _prepare_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
     prepared = []
     for record in records:
         ts_dt = _event_timestamp(record)
+        meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
         prepared.append(
             {
                 "Timestamp (UTC)": _format_timestamp(ts_dt),
@@ -72,7 +88,17 @@ def _prepare_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
                 "Action": str(record.get("action") or "-"),
                 "Case ID": str(record.get("case_id") or "N/A"),
                 "_page": str(record.get("page") or "-"),
-                "_meta": record.get("meta") or {},
+                "_meta": meta,
+                "_status": _first_present(record.get("status"), meta.get("status")),
+                "_channel": _first_present(record.get("channel"), record.get("page"), meta.get("channel")),
+                "_latency": _first_present(
+                    record.get("latency_ms"),
+                    record.get("latency"),
+                    meta.get("latency_ms"),
+                    meta.get("latency"),
+                ),
+                "_error": _first_present(record.get("error"), meta.get("error")),
+                "_message": _first_present(record.get("message"), meta.get("message")),
                 "_ts_dt": ts_dt,
             }
         )
@@ -87,6 +113,11 @@ def _prepare_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
                 "Case ID",
                 "_page",
                 "_meta",
+                "_status",
+                "_channel",
+                "_latency",
+                "_error",
+                "_message",
                 "_ts_dt",
             ]
         )
@@ -310,21 +341,42 @@ def main() -> None:
         selected_row = filtered.iloc[labels.index(selected_label)]
 
         with st.expander("View details", expanded=False):
-            st.markdown(f"**Timestamp (UTC):** {selected_row['Timestamp (UTC)']}")
-            st.markdown(f"**User / Action:** {selected_row['User']} - {selected_row['Action']}")
-            st.markdown(f"**Case ID:** {selected_row['Case ID']}")
-            detail_cols = st.columns(3)
-            detail_cols[0].markdown("**Status:** success")
-            detail_cols[1].markdown(f"**Channel:** {selected_row['_page']}")
-            detail_cols[2].markdown("**Latency:** -")
-            st.markdown("**IP:** -")
-            st.markdown("**Request ID:** -")
-            st.markdown("**Notes**")
+            detail_pairs = [
+                ("Timestamp (UTC)", selected_row.get("Timestamp (UTC)")),
+                ("User", selected_row.get("User")),
+                ("Action", selected_row.get("Action")),
+                ("Case ID", selected_row.get("Case ID")),
+                ("Status", selected_row.get("_status")),
+                ("Channel", selected_row.get("_channel")),
+            ]
+            summary_parts = [str(value).strip() for _, value in detail_pairs if not is_empty(value)]
+            if summary_parts:
+                st.caption(" | ".join(summary_parts))
+
+            for label, value in detail_pairs:
+                if is_empty(value):
+                    continue
+                st.markdown(f"**{label}:** {value}")
+
+            latency_value = selected_row.get("_latency")
+            if not is_empty(latency_value):
+                latency_text = str(latency_value).strip()
+                if not latency_text.lower().endswith("ms"):
+                    latency_text = f"{latency_text} ms"
+                st.markdown(f"**Latency:** {latency_text}")
+
+            status_value = str(selected_row.get("_status") or "").strip().lower()
+            error_value = selected_row.get("_error")
+            message_value = selected_row.get("_message")
+            if not is_empty(error_value):
+                st.markdown(f"**Error:** {error_value}")
+            if not is_empty(message_value) and (status_value != "success" or not is_empty(error_value)):
+                st.markdown(f"**Message:** {message_value}")
+
             meta_value = selected_row["_meta"] if isinstance(selected_row["_meta"], dict) else {}
             if meta_value:
-                st.write(meta_value)
-            else:
-                st.write("No additional metadata.")
+                with st.expander("Metadata", expanded=False):
+                    st.json(meta_value)
 
         csv_bytes = display_df.to_csv(index=False).encode("utf-8")
         st.download_button(
