@@ -49,7 +49,6 @@ def main() -> None:
 
     st.title("Create User")
     render_auth_status("register")
-    st.caption("Admins can create new user accounts stored in Firestore.")
 
     if current.role.strip().lower() != "admin":
         st.error("Only admin accounts can create users.")

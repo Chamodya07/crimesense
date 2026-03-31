@@ -178,7 +178,6 @@ def _render_rag_evidence(case: dict) -> None:
         return
 
     if has_summary:
-        st.markdown("**RAG Summary**")
         summary_lines = []
         for key in (
             "evidence_strength",
@@ -207,7 +206,7 @@ def _render_rag_evidence(case: dict) -> None:
         import pandas as pd
 
         if has_rag_items:
-            st.markdown("#### Top Similar Cases (RAG Index)")
+            st.markdown("#### Top Similar Cases")
             df_rag = pd.DataFrame(rag_items)
             preferred = [
                 "score",
@@ -231,7 +230,7 @@ def _render_rag_evidence(case: dict) -> None:
             st.dataframe(df_rag.reindex(columns=cols), use_container_width=True, hide_index=True)
 
         if has_saved_items:
-            st.markdown("#### Similar Saved Cases (History)")
+            st.markdown("#### Similar Saved Cases")
             df_saved = pd.DataFrame(similar_saved_cases)
             preferred_saved = [
                 "score",
@@ -413,7 +412,6 @@ def main() -> None:
     header_left, header_right = st.columns([3, 1.2])
     with header_left:
         st.title("Past Predicted Profiles")
-        st.caption("Review prior predictions; select a case to view its details.")
     with header_right:
         s_col, f_col, x_col = st.columns([0.54, 0.30, 0.16], gap="small")
         with s_col:
@@ -434,7 +432,6 @@ def main() -> None:
             st.button("X", help="Clear search and show all cases", on_click=clear_search, key="clear_history_search")
 
     raw_records, all_cases = seed_cases()
-    st.caption(f"Fetched {len(raw_records)} history records")
     cases = list(all_cases)
     query = st.session_state.get("history_search_input", "").strip().lower()
     if query:

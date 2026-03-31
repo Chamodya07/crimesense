@@ -258,7 +258,6 @@ def main() -> None:
     render_auth_status("audit")
 
     st.title("Audit Log")
-    st.caption("Must-have for FR08 - trace user actions and model/data versions.")
 
     try:
         import services.audit_service as audit_service
@@ -270,10 +269,8 @@ def main() -> None:
     if not callable(current_user_getter):
         current_user_getter = getattr(audit_service, "get_current_user_label", None)
     current_user_label = current_user_getter() if callable(current_user_getter) else "unknown"
-    st.caption(f"Current user resolved as: {current_user_label}")
 
     all_events = load_audit_events(limit=500)
-    st.caption(f"First event keys: {list(all_events[0].keys()) if all_events else []}")
     users = ["All users"] + sorted(
         {str(item.get("user") or "").strip() for item in all_events if str(item.get("user") or "").strip()}
     )
@@ -374,9 +371,6 @@ def main() -> None:
                 st.markdown(f"**Message:** {message_value}")
 
             meta_value = selected_row["_meta"] if isinstance(selected_row["_meta"], dict) else {}
-            if meta_value:
-                with st.expander("Metadata", expanded=False):
-                    st.json(meta_value)
 
         csv_bytes = display_df.to_csv(index=False).encode("utf-8")
         st.download_button(

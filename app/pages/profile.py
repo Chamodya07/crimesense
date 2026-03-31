@@ -666,48 +666,76 @@ def main() -> None:
     # retain a small translation dict only for backwards compatibility, but
     # it should normally remain empty.
     UI_TO_MODEL: dict = {}
+    CITY_PLACEHOLDER = "Select city"
+    PRIMARY_TYPE_PLACEHOLDER = "Select primary type"
+    LOCATION_PLACEHOLDER = "Select location description"
+    WEAPON_PLACEHOLDER = "Select weapon description"
+
+    def _with_placeholder(options: list[str], placeholder: str) -> list[str]:
+        values = [str(option) for option in options]
+        if placeholder in values:
+            return values
+        return [placeholder, *values]
 
     # form data collection
     form_data: dict = {}
     # Incident Details
     with st.expander("Incident Details", expanded=True):
+        city_key = "profile_city"
+        city_options = [CITY_PLACEHOLDER, "NYPD (New York)", "LA (Los Angeles)"]
+        if st.session_state.get(city_key) not in city_options:
+            st.session_state[city_key] = CITY_PLACEHOLDER
         form_data["city"] = st.selectbox(
             "City",
-            options=["NYPD (New York)", "LA (Los Angeles)"],
+            options=city_options,
+            key=city_key,
         )
         # primary_type selectbox with ability to specify custom
         fallback_crime_options = ["", "Theft", "Assault", "Robbery", "Burglary", "Homicide", "Other"]
-        cases_csv_path = _resolve_city_cases_csv(form_data["city"])
-        crime_options = load_primary_types(str(cases_csv_path))
-        if not crime_options:
+        if form_data["city"] == CITY_PLACEHOLDER:
             crime_options = fallback_crime_options
+            place_options = ["Unknown"]
+        else:
+            cases_csv_path = _resolve_city_cases_csv(form_data["city"])
+            crime_options = load_primary_types(str(cases_csv_path))
+            if not crime_options:
+                crime_options = fallback_crime_options
+            place_options = load_places(str(cases_csv_path))
         primary_type_key = "profile_primary_type"
-        if st.session_state.get(primary_type_key) not in crime_options:
-            st.session_state[primary_type_key] = crime_options[0]
-        primary_choice = st.selectbox("Primary type", options=crime_options, key=primary_type_key)
-        if primary_choice == "Other":
+        primary_type_options = _with_placeholder(crime_options, PRIMARY_TYPE_PLACEHOLDER)
+        if st.session_state.get(primary_type_key) not in primary_type_options:
+            st.session_state[primary_type_key] = PRIMARY_TYPE_PLACEHOLDER
+        primary_choice = st.selectbox("Primary type", options=primary_type_options, key=primary_type_key)
+        if primary_choice == PRIMARY_TYPE_PLACEHOLDER:
+            form_data["primary_type"] = ""
+        elif primary_choice == "Other":
             form_data["primary_type"] = st.text_input("Specify crime type")
         else:
             form_data["primary_type"] = primary_choice
         # location description
-        place_options = load_places(str(cases_csv_path))
         location_key = "profile_location_desc"
-        if st.session_state.get(location_key) not in place_options:
-            st.session_state[location_key] = place_options[0]
+        location_options = _with_placeholder(place_options, LOCATION_PLACEHOLDER)
+        if st.session_state.get(location_key) not in location_options:
+            st.session_state[location_key] = LOCATION_PLACEHOLDER
         form_data["location_desc"] = st.selectbox(
             "Location description",
-            options=place_options,
+            options=location_options,
             key=location_key,
         )
+        if form_data["location_desc"] == LOCATION_PLACEHOLDER:
+            form_data["location_desc"] = ""
         weapon_options = load_la_weapons()
         weapon_key = "profile_weapon_desc"
-        if st.session_state.get(weapon_key) not in weapon_options:
-            st.session_state[weapon_key] = "Unknown" if "Unknown" in weapon_options else weapon_options[0]
+        weapon_select_options = _with_placeholder(weapon_options, WEAPON_PLACEHOLDER)
+        if st.session_state.get(weapon_key) not in weapon_select_options:
+            st.session_state[weapon_key] = WEAPON_PLACEHOLDER
         form_data["weapon_desc"] = st.selectbox(
             "Weapon description",
-            options=weapon_options,
+            options=weapon_select_options,
             key=weapon_key,
         )
+        if form_data["weapon_desc"] == WEAPON_PLACEHOLDER:
+            form_data["weapon_desc"] = ""
         form_data["arrest"] = st.checkbox("Arrest made", value=False)
         form_data["domestic"] = st.checkbox("Domestic incident", value=False)
     # Time & Date
@@ -767,12 +795,8 @@ def main() -> None:
                 "Other",
             ],
         )
-    with st.expander("Offender Indicators (optional)", expanded=False):
-        st.write("These values are predicted and will appear after you click **Predict**.")
-
     # narrative field below tabs
     narrative = st.text_area("Narrative / Description (optional)", height=160)
-    st.caption("If narrative is provided, NLP + late fusion will run; otherwise tabular-only.")
 
     # helper to determine if form has any user-provided info. treat
     # zero/empty strings as "no input" and count a checked checkbox as input.
@@ -800,23 +824,44 @@ def main() -> None:
         ):
             st.session_state.pop(key, None)
 
-    def _valid_required_fields(candidate: dict) -> bool:
-        def _clean(value):
+    def _missing_required_fields(candidate: dict) -> list[str]:
+        def _normalize(value) -> str:
             if value is None:
                 return ""
-            text = str(value).strip()
-            if text.lower() in {"", "unknown", "none", "nan"}:
-                return ""
-            return text
+            return str(value).strip()
 
-        primary = _clean(candidate.get("primary_type") or candidate.get("crime_type") or candidate.get("type"))
-        location = _clean(
+        def _is_missing(value, placeholder: str, *, allow_unknown: bool = False) -> bool:
+            text = _normalize(value)
+            if not text:
+                return True
+            invalid_values = {placeholder.lower(), "none", "nan"}
+            if not allow_unknown:
+                invalid_values.add("unknown")
+            return text.lower() in invalid_values
+
+        missing_fields: list[str] = []
+        if _is_missing(candidate.get("city"), CITY_PLACEHOLDER):
+            missing_fields.append("City")
+        if _is_missing(
+            candidate.get("primary_type") or candidate.get("crime_type") or candidate.get("type"),
+            PRIMARY_TYPE_PLACEHOLDER,
+        ):
+            missing_fields.append("Primary type")
+        if _is_missing(
             candidate.get("location_desc")
             or candidate.get("location")
             or candidate.get("premise")
-            or candidate.get("place")
-        )
-        return bool(primary and location)
+            or candidate.get("place"),
+            LOCATION_PLACEHOLDER,
+        ):
+            missing_fields.append("Location description")
+        if _is_missing(
+            candidate.get("weapon_desc") or candidate.get("weapon"),
+            WEAPON_PLACEHOLDER,
+            allow_unknown=True,
+        ):
+            missing_fields.append("Weapon description")
+        return missing_fields
 
     if "has_prediction" not in st.session_state:
         st.session_state["has_prediction"] = False
@@ -882,9 +927,13 @@ def main() -> None:
                 "race": _clean_optional_text(victim_race),
             }
 
-            if not _valid_required_fields(case_dict):
+            missing_fields = _missing_required_fields(case_dict)
+            if missing_fields:
                 _clear_prediction_state()
-                st.warning("Please fill required fields: Crime type and Location.")
+                st.warning(
+                    "Please fill in all required incident details before running prediction. "
+                    f"Missing: {', '.join(missing_fields)}."
+                )
                 return
 
             case_id = _compute_case_id(case_dict, narrative)
@@ -898,19 +947,6 @@ def main() -> None:
             except Exception:
                 # protect against our helper failing
                 row_for_model, row_summary = case_dict, {"filled": 0, "defaulted": 0, "missing": []}
-
-            # debug expander showing the features going to the model
-            with st.expander("Debug (model inputs)"):
-                non_zero = row_summary.get("filled", 0)
-                st.write(f"Non-default features: {non_zero} of {len(_features)}")
-                # preview up to 20 non-default key/value pairs so users can sanity
-                # check what will be sent. don't dump the entire dict here to keep
-                # the expander concise.
-                nonzero_items = [(k, v) for k, v in row_for_model.items() if v not in (0, "", None)]
-                if nonzero_items:
-                    st.write("Sample non-default inputs:", nonzero_items[:20])
-                if non_zero < 3:
-                    st.warning("Most features are defaulted; model may output constant results.")
 
             # proceed with existing prediction pipeline
             from services.pipeline_service import run_profile
@@ -970,7 +1006,6 @@ def main() -> None:
         motive_band = mot_info.get("band")
 
         # mimic the prior fused summary style but only show relevant columns
-        st.markdown("### Fused offender profile (combined models)")
         st.caption(f"Case ID: {case_id}")
         cols = st.columns(4)
         cols[0].metric("Risk level", risk)
@@ -1237,8 +1272,8 @@ def main() -> None:
             saved_message_level = "warning"
             saved_debug = {}
 
-        st.markdown("### Similar Past Cases (RAG Evidence)")
-        st.markdown("#### Top Similar Cases (RAG Index)")
+        st.markdown("### Similar Past Cases")
+        st.markdown("#### Top Similar Cases")
         if sim_cases:
             df_sim = _sanitize_evidence_display_df(pd.DataFrame(sim_cases))
             rag_dataset_id = _resolve_rag_dataset_id(rag_meta, df_sim)
@@ -1250,13 +1285,12 @@ def main() -> None:
             rag_summary_to_save = _build_rag_summary_for_dataset(df_sim, rag_dataset_id)
             summary_lines = _rag_summary_lines(rag_summary_to_save)
             rag_top_cases_to_save = df_sim_display.to_dict(orient="records")
-            st.markdown("**RAG Summary**")
             st.markdown("\n".join(f"- {line}" for line in summary_lines))
             st.dataframe(df_sim_display, use_container_width=True)
         else:
             st.info(rag_message or "No similar cases found / index missing.")
 
-        st.markdown("#### Similar Saved Cases (History)")
+        st.markdown("#### Similar Saved Cases")
         if saved_sim_cases:
             df_saved = pd.DataFrame(saved_sim_cases)
             saved_cols = _build_saved_display_columns(df_saved)
@@ -1491,10 +1525,6 @@ def main() -> None:
             if export_clicked:
                 _log_profile_event("export", case_id, fused)
 
-        # offender indicators expander with predicted metrics
-        with st.expander("Offender Indicators (optional)"):
-            st.write("Not applicable â€“ model does not predict additional indicators.")
-
         # warnings and ethical notice
         warn = fused.get("fusion_meta", {}).get("warnings", [])
         if warn:
@@ -1522,16 +1552,6 @@ def main() -> None:
                 df_feats = pd.DataFrame(tab_feats)[:8]
                 df_feats = df_feats.rename(columns={"feature": "Feature", "value": "Value"})
                 st.table(df_feats)
-
-        with st.expander("NLP evidence (topâ€‘k)"):
-            if topk:
-                st.table(df_topk)
-            else:
-                st.write("No NLP motive topâ€‘k data available.")
-
-        # debug output for developers
-        with st.expander("DEBUG: raw fused output"):
-            st.json(fused)
 
 
 if __name__ == "__main__":
