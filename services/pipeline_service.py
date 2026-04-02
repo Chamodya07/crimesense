@@ -128,10 +128,14 @@ def run_profile(
         explanations["nlp_topk"] = nlp_out.get("topk", []) or []
         explanations["nlp_pred"] = nlp_out.get("pred", "") or ""
         explanations["nlp_confidence"] = float(nlp_out.get("confidence", 0.0) or 0.0)
+        explanations["nlp_source"] = nlp_out.get("source", "") or ""
+        explanations["nlp_reason"] = nlp_out.get("reason", "") or ""
     else:
         explanations["nlp_topk"] = []
         explanations["nlp_pred"] = ""
         explanations["nlp_confidence"] = 0.0
+        explanations["nlp_source"] = ""
+        explanations["nlp_reason"] = ""
 
     # Attach raw outputs for storage/audit
     fused["_tabular_output"] = tab_out

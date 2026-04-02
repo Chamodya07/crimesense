@@ -7,19 +7,23 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import MODELS
 
 
+def _nlp_topk_items(nlp_topk: Optional[Any]) -> List[Dict[str, Any]]:
+    if not nlp_topk:
+        return []
+    if isinstance(nlp_topk, dict):
+        topk = nlp_topk.get("topk", [])
+        return topk if isinstance(topk, list) else []
+    return nlp_topk if isinstance(nlp_topk, list) else []
+
+
 def nlp_topk_to_probs(nlp_topk: Optional[Any]) -> Dict[str, float]:
     """Convert NLP output (list or dict) to normalized label->prob mapping.
 
     The prediction may be a raw list of ``{"label","prob"}`` pairs or the
-    richer dictionary returned by :func:`predict_nlp_topk`.  If the argument is
-    ``None`` an empty dict is returned.
+    richer dictionary returned by :func:`predict_nlp_topk`. If the argument is
+    ``None`` or contains no usable scores an empty dict is returned.
     """
-    if not nlp_topk:
-        return {}
-    if isinstance(nlp_topk, dict):
-        topk = nlp_topk.get("topk", [])
-    else:
-        topk = nlp_topk
+    topk = _nlp_topk_items(nlp_topk)
     total = sum(float(x.get("prob", 0) or 0) for x in topk)
     if total <= 0:
         return {}
@@ -48,7 +52,6 @@ def fuse_motive(
             "band": "Low",
             "probs": {},
         }
-    # Renormalize
     total = sum(combined.values())
     if total > 0:
         combined = {k: v / total for k, v in combined.items()}
@@ -71,17 +74,15 @@ def late_fusion_predict(
 ) -> Dict[str, Any]:
     """Late fusion: combine tabular + NLP into one unified response object.
 
-    - All tabular targets are retained.  The motive target is fused with the
-      NLP probabilities if available.
+    - All tabular targets are retained. The motive target is fused with NLP
+      probabilities only when a real NLP output is present.
     - ``tab_pred`` may be either the old flattened dict or the newer structure
       containing a ``pred`` field; code handles both.
     """
     warnings: List[str] = []
 
-    # support the newer output format where predictions live under "pred"
     flat_tab = tab_pred.get("pred") if "pred" in tab_pred else tab_pred
 
-    # determine which key corresponds to motive if caller didn't supply one
     if motive_key not in flat_tab:
         for candidate in ("motive", "primary_motive", "crime_motive"):
             if candidate in flat_tab:
@@ -89,10 +90,17 @@ def late_fusion_predict(
                 break
 
     tab_motive = flat_tab.get(motive_key)
+    nlp_topk_rows = _nlp_topk_items(nlp_topk)
     nlp_probs = nlp_topk_to_probs(nlp_topk)
+    has_nlp_signal = bool(nlp_probs)
+    nlp_source = nlp_topk.get("source", "") if isinstance(nlp_topk, dict) else ("real" if nlp_topk_rows else "")
+    nlp_reason = nlp_topk.get("reason", "") if isinstance(nlp_topk, dict) else ""
 
-    if not nlp_topk:
-        warnings.append("Narrative missing or empty — NLP motive prediction skipped.")
+    if not has_nlp_signal:
+        if nlp_source == "unavailable":
+            warnings.append("NLP motive model unavailable. Final motive shown from tabular output only.")
+        else:
+            warnings.append("Narrative missing or empty - NLP motive prediction skipped.")
         motive_result = {
             "pred": tab_motive if tab_motive else "Unknown",
             "conf": 0.0,
@@ -110,35 +118,37 @@ def late_fusion_predict(
         if motive_result["conf"] < 0.50:
             warnings.append(f"Fused motive confidence ({motive_result['conf']:.2f}) is below 0.50.")
 
-    # Build final targets container
     final: Dict[str, Any] = {}
-    # copy everything except motive_key from original flat_tab
-    for k, v in flat_tab.items():
-        if k != motive_key:
-            final[k] = v
+    for key, value in flat_tab.items():
+        if key != motive_key:
+            final[key] = value
     final[motive_key] = motive_result
 
     fusion_rationale = (
         "Motive fused from tabular label and NLP narrative top-k probabilities "
         "(w_tab=0.35, w_nlp=0.65)."
     )
-    if not nlp_topk:
-        fusion_rationale = "Motive from tabular model only; no narrative provided for NLP."
+    if not has_nlp_signal:
+        if nlp_source == "unavailable":
+            fusion_rationale = "Motive from tabular model only; NLP motive model is unavailable."
+        else:
+            fusion_rationale = "Motive from tabular model only; no narrative provided for NLP."
 
-    # summaries
     tabular_summary = {
-        "risk_category": flat_tab.get("risk_level") or flat_tab.get("risk_category", "—"),
-        "risk_score": flat_tab.get("risk_score", "—"),
-        "motive": flat_tab.get(motive_key, "—"),
-        "experience_level": flat_tab.get("experience_level", "—"),
+        "risk_category": flat_tab.get("risk_level") or flat_tab.get("risk_category", "-"),
+        "risk_score": flat_tab.get("risk_score", "-"),
+        "motive": flat_tab.get(motive_key, "-"),
+        "experience_level": flat_tab.get("experience_level", "-"),
     }
     nlp_summary = {
-        "risk_category": "—",
-        "risk_score": "—",
-        "motive": nlp_topk.get("pred") if isinstance(nlp_topk, dict) else (nlp_topk[0]["label"] if nlp_topk else "—"),
-        "experience_level": "—",
+        "risk_category": "-",
+        "risk_score": "-",
+        "motive": nlp_topk.get("pred") if isinstance(nlp_topk, dict) else (nlp_topk_rows[0]["label"] if nlp_topk_rows else "-"),
+        "experience_level": "-",
         "key_phrases": [],
-        "topk": nlp_topk.get("topk") if isinstance(nlp_topk, dict) else (nlp_topk or []),
+        "topk": nlp_topk_rows if has_nlp_signal else [],
+        "source": nlp_source,
+        "reason": nlp_reason,
     }
 
     return {
@@ -152,7 +162,7 @@ def late_fusion_predict(
         "explanations": {
             "tabular": tabular_summary,
             "nlp": nlp_summary,
-            "tabular_top_features": [{"feature": f, "value": v} for f, v in shap_top],
+            "tabular_top_features": [{"feature": feature, "value": value} for feature, value in shap_top],
             "nlp_topk": nlp_summary.get("topk", []),
             "fusion_rationale": fusion_rationale,
         },
@@ -168,7 +178,6 @@ def late_fusion_predict(
 
 
 if __name__ == "__main__":
-    # Unit-like test
     tab = {"risk_level": "Medium", "motive": "Property-focused", "offender_type": "Organized"}
     shap = [("incident_severity", 0.3), ("prior_incidents", 0.2)]
     nlp = [

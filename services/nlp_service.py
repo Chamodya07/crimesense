@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,13 +12,59 @@ from config import MODELS, PATHS
 from services.tabular_service import ModelNotAvailableError
 
 
-def _friendly_error_nlp(base_dir: Path) -> str:
+def _nlp_candidate_dirs() -> List[Path]:
+    candidates: List[Path] = []
+    for candidate in (PATHS.nlp_model_dir, PATHS.nlp_model_dir.parent):
+        path = Path(candidate)
+        if path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
+def _has_model_artifacts(base_dir: Path) -> bool:
+    if not base_dir.exists() or not base_dir.is_dir():
+        return False
+    has_config = (base_dir / "config.json").exists()
+    has_weights = any(
+        (base_dir / filename).exists()
+        for filename in ("model.bin", "pytorch_model.bin", "model.safetensors")
+    )
+    return has_config and has_weights
+
+
+def _load_label_map(base_dir: Path) -> Dict[int, str]:
+    label_map_path = base_dir / "label_map.json"
+    if not label_map_path.exists():
+        return {}
+    try:
+        raw = json.loads(label_map_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    normalized: Dict[int, str] = {}
+    if not isinstance(raw, dict):
+        return normalized
+
+    for key, value in raw.items():
+        try:
+            normalized[int(key)] = str(value)
+        except Exception:
+            continue
+    return normalized
+
+
+def _friendly_error_nlp(base_dir: Path | None = None) -> str:
     """Build a friendly error message for missing NLP artifacts."""
+    searched = "\n".join(f"  - {path}" for path in _nlp_candidate_dirs())
+    expected = base_dir or PATHS.nlp_model_dir
     return (
         "NLP model files were not found.\n\n"
-        f"Expected at: {base_dir}\n\n"
+        f"Expected at: {expected}\n\n"
+        "Searched:\n"
+        f"{searched}\n\n"
         "To enable text-based motive predictions, place your trained NLP model in:\n"
-        f"  - {PATHS.nlp_model_dir}\n\n"
+        f"  - {PATHS.nlp_model_dir}\n"
+        f"  - {PATHS.nlp_model_dir.parent}\n\n"
         "Update `services.nlp_service.load_nlp_model` if your model uses a different structure."
     )
 
@@ -26,21 +73,14 @@ def _friendly_error_nlp(base_dir: Path) -> str:
 def load_nlp_model() -> Dict[str, Any]:
     """Load the NLP model artefacts.
 
-    Expects artifacts/nlp/model/ to contain the model files.
+    Expects a local transformer model directory under ``artifacts/nlp/model/``
+    or ``artifacts/nlp/`` with at least ``config.json`` and weights.
     """
-    model_dir: Path = PATHS.nlp_model_dir
-    # Support both model.bin (legacy) and standard transformer/model dirs
-    model_file = model_dir / "model.bin"
-    if not model_file.exists():
-        # Check for pytorch_model.bin, model.safetensors, or config.json (transformer)
-        if not model_dir.exists():
-            raise ModelNotAvailableError(_friendly_error_nlp(model_dir))
-        # If dir exists but no model.bin, check for config.json (HuggingFace style)
-        config_file = model_dir / "config.json"
-        if not config_file.exists():
-            raise ModelNotAvailableError(_friendly_error_nlp(model_dir))
+    for model_dir in _nlp_candidate_dirs():
+        if _has_model_artifacts(model_dir):
+            return {"model_path": str(model_dir), "version": MODELS.nlp_model_version}
 
-    return {"model_path": str(model_dir), "version": MODELS.nlp_model_version}
+    raise ModelNotAvailableError(_friendly_error_nlp())
 
 
 def predict_nlp_topk(text: str, top_k: int = 5) -> Optional[Dict[str, Any]]:
@@ -54,12 +94,24 @@ def predict_nlp_topk(text: str, top_k: int = 5) -> Optional[Dict[str, Any]]:
             "confidence": <top1_prob>
         }
 
-    or ``None`` if the input text is empty.  If the real transformer model
-    is available the function will use it; otherwise a mock or default
-    response is returned.  Probabilities are normalised to sum to 1.0.
+    or ``None`` if the input text is empty. Only a real, successfully loaded
+    model may produce top-k probabilities. If no model is available, the
+    function returns an unavailable status with an empty top-k list.
     """
     if not text or not str(text).strip():
         return None
+
+    def format_unavailable(reason: str, error: Exception | None = None) -> Dict[str, Any]:
+        output: Dict[str, Any] = {
+            "topk": [],
+            "pred": "",
+            "confidence": 0.0,
+            "source": "unavailable",
+            "reason": reason,
+        }
+        if error is not None:
+            output["error"] = str(error)
+        return output
 
     def format_output(lst: List[Dict[str, Any]]) -> Dict[str, Any]:
         normalized = [
@@ -70,14 +122,14 @@ def predict_nlp_topk(text: str, top_k: int = 5) -> Optional[Dict[str, Any]]:
             for item in lst
         ]
         if not normalized:
-            return {"topk": [], "pred": "", "confidence": 0.0}
+            return {"topk": [], "pred": "", "confidence": 0.0, "source": "real"}
         pred = normalized[0].get("label", "")
         conf = float(normalized[0].get("prob", 0.0) or 0.0)
-        return {"topk": normalized, "pred": pred, "confidence": conf}
+        return {"topk": normalized, "pred": pred, "confidence": conf, "source": "real"}
 
     try:
         # ensure model artefacts exist; may raise ModelNotAvailableError
-        load_nlp_model()
+        model_info = load_nlp_model()
 
         # attempt to perform real transformer inference
         try:
@@ -91,12 +143,18 @@ def predict_nlp_topk(text: str, top_k: int = 5) -> Optional[Dict[str, Any]]:
         # cache the tokenizer and model to avoid reloads on every call
         @st.cache_resource(show_spinner=False)
         def _cached_transformer(path: str):
+            model_dir = Path(path)
             tok = AutoTokenizer.from_pretrained(path)
             mdl = AutoModelForSequenceClassification.from_pretrained(path)
-            return tok, mdl
+            label_map = _load_label_map(model_dir)
+            if label_map:
+                mdl.config.id2label = dict(label_map)
+                mdl.config.label2id = {label: idx for idx, label in label_map.items()}
+            return tok, mdl, label_map
 
-        model_path = PATHS.nlp_model_dir if isinstance(PATHS.nlp_model_dir, str) else str(PATHS.nlp_model_dir)
-        tokenizer, model = _cached_transformer(model_path)
+        model_path = str(model_info["model_path"])
+        tokenizer, model, label_map = _cached_transformer(model_path)
+        model.eval()
 
         inputs = tokenizer(text, return_tensors="pt", truncation=True)
         with torch.no_grad():
@@ -105,30 +163,16 @@ def predict_nlp_topk(text: str, top_k: int = 5) -> Optional[Dict[str, Any]]:
         # softmax
         exp = np.exp(logits - np.max(logits))
         probs = exp / exp.sum()
-        labels = [model.config.id2label.get(i, str(i)) for i in range(len(probs))]
+        labels = [label_map.get(i) or model.config.id2label.get(i, str(i)) for i in range(len(probs))]
         idx_sorted = probs.argsort()[::-1][:top_k]
         topk_list = [{"label": labels[i], "prob": float(probs[i])} for i in idx_sorted]
         return format_output(topk_list)
 
     except ModelNotAvailableError:
-        # no model artefacts, produce a heuristic mock list
-        lowered = text.lower()
-        candidates = [
-            ("Control / dominance (mock)", 0.4 if "stalking" in lowered or "control" in lowered else 0.1),
-            ("Property-focused (mock)", 0.35 if "burglary" in lowered or "theft" in lowered else 0.15),
-            ("Opportunistic (mock)", 0.25 if "random" in lowered or "chance" in lowered else 0.1),
-            ("Revenge / grievance (mock)", 0.2 if "revenge" in lowered or "grudge" in lowered else 0.05),
-            ("Financial gain (mock)", 0.15 if "money" in lowered or "fraud" in lowered else 0.05),
-        ]
-        total = sum(p for _, p in candidates)
-        if total <= 0:
-            total = 1.0
-        topk_list = [{"label": lbl, "prob": round(p / total, 4)} for lbl, p in candidates[:top_k]]
-        return format_output(topk_list)
+        return format_unavailable("model_not_available")
     except Exception as e:
-        # any other failure (import issue, inference error, etc.)
-        st.error(f"NLP inference error: {e}")
-        return None
+        # any other failure (import issue, load error, inference error, etc.)
+        return format_unavailable("load_or_inference_error", error=e)
 
 
 __all__ = ["load_nlp_model", "predict_nlp_topk"]

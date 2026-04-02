@@ -1001,6 +1001,8 @@ def main() -> None:
         severity = clean_str(final.get("crime_severity", EM_DASH))
         experience = clean_str(final.get("offender_experience", EM_DASH))
         mot_info = final.get("motive") if isinstance(final.get("motive"), dict) else {}
+        nlp_info = fused.get("_nlp_output", {}) if isinstance(fused.get("_nlp_output", {}), dict) else {}
+        nlp_source = str(nlp_info.get("source", "") or "").strip().lower()
         motive_pred = clean_str(mot_info.get("pred", "")) if mot_info else ""
         motive_conf = mot_info.get("conf") or mot_info.get("confidence")
         motive_band = mot_info.get("band")
@@ -1014,13 +1016,13 @@ def main() -> None:
         if motive_pred:
             delta_text = None
             if motive_conf is not None or motive_band:
-                conf_str = f"{motive_conf:.2f}" if motive_conf is not None else "â€”"
+                conf_str = f"{motive_conf:.2f}" if motive_conf is not None else EM_DASH
                 delta_text = f"{conf_str}{' (' + motive_band + ')' if motive_band else ''}"
             cols[3].metric("Final motive", motive_pred, delta=delta_text)
         else:
-            cols[3].metric("Final motive", "â€”")
+            cols[3].metric("Final motive", EM_DASH)
 
-        # profiling traits table â€“ only keep the three targets (motive shown separately)
+        # profiling traits table - only keep the three targets (motive shown separately)
         import pandas as pd
 
         traits = []
@@ -1047,22 +1049,17 @@ def main() -> None:
         # motive details section
         st.markdown("### Motive details")
         if motive_pred:
-            conf_display = f"{motive_conf:.2f}" if motive_conf is not None else "â€”"
+            conf_display = f"{motive_conf:.2f}" if motive_conf is not None else EM_DASH
             st.markdown(
-                f"**Motive:** {motive_pred} (Confidence: {conf_display}, Band: {motive_band or 'â€”'})"
+                f"**Motive:** {motive_pred} (Confidence: {conf_display}, Band: {motive_band or EM_DASH})"
             )
+            if nlp_source == "unavailable":
+                st.caption("NLP motive model unavailable. Showing motive from the structured/tabular path only.")
         else:
             st.write("**Motive:** Not provided")
             if not narrative.strip():
-                st.warning("Narrative missing â€” motive not predicted.")
+                st.warning("Narrative missing - motive not predicted.")
         topk = fused.get("explanations", {}).get("nlp_topk", [])
-        if topk:
-            st.markdown("#### NLP topâ€‘k probabilities")
-            df_topk = pd.DataFrame(topk)
-            if "prob" in df_topk.columns:
-                df_topk["prob"] = df_topk["prob"].astype(float).round(3)
-            df_topk = df_topk.rename(columns={"label": "Label", "prob": "Probability"})
-            st.table(df_topk)
 
         # similar past cases via RAG retrieval + similar saved history
         rag_message: str | None = None
